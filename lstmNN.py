@@ -11,23 +11,21 @@ import matplotlib.pyplot as plt
 CSV_PATH = r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
 CACHE_DIR = r"c:\Users\vince\Desktop\NN"
 
-# New unique cache paths specific to the filtered LSTM pipeline (misure only)
+# Cache paths for the preprocessed LSTM pipeline (misure only)
 X_ALL_PATH = os.path.join(CACHE_DIR, "X_all_lstm_no2017_misure.npy")
 Y_ALL_PATH = os.path.join(CACHE_DIR, "y_all_lstm_no2017_misure.npy")
 PID_ALL_PATH = os.path.join(CACHE_DIR, "pid_all_lstm_no2017_misure.npy")
 TIME_ALL_PATH = os.path.join(CACHE_DIR, "time_all_lstm_no2017_misure.npy")
 
 EPOCHS = 500
-BATCH_SIZE = 512 # Andiamo a 256/128
+BATCH_SIZE = 256  # Ridotto a 256 per favorire una migliore regolarizzazione e convergenza dei gradienti
 LEARNING_RATE = 1e-3
-
 
 # --- 1. Data Preparation, Filtering and Caching ---
 def load_and_preprocess_data():
     """
-    Loads pre-processed numpy arrays if they exist.
-    Otherwise, reads the CSV, filters out the year 2017, parses vectors,
-    sorts by patient and time, and caches the global arrays.
+    Carica i vettori pre-elaborati se presenti in cache.
+    In caso contrario, esegue il parsing del CSV filtrando il 2017 e isolando la colonna 'misure'.
     """
     cache_exists = all(os.path.exists(p) for p in [X_ALL_PATH, Y_ALL_PATH, PID_ALL_PATH, TIME_ALL_PATH])
     
@@ -46,13 +44,13 @@ def load_and_preprocess_data():
     df = pd.read_csv(CSV_PATH)
     print(f"Loaded CSV file in {time.time() - t_start:.2f}s. Initial row count: {len(df)}")
     
-    # Filter out sessions from the year 2017
+    # Filtro anno 2017
     print("Filtering out rows from the year 2017...")
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df = df[df['timestamp'].dt.year != 2017].reset_index(drop=True)
     print(f"Rows remaining after 2017 exclusion: {len(df)}")
     
-    # Sort primarily by patient_id and secondarily by timestamp for sequence consistency
+    # Ordinamento cronologico per paziente
     print("Sorting rows by patient_id and chronologically by timestamp...")
     df = df.sort_values(by=['patient_id', 'timestamp']).reset_index(drop=True)
     
@@ -64,7 +62,7 @@ def load_and_preprocess_data():
         print(f"Parsed column '{series.name}' in {time.time() - t0:.2f}s. Feature size: {reshaped.shape[1]}")
         return reshaped
 
-    print("Parsing vector columns...")
+    print("Parsing vector column 'misure'...")
     t_parse = time.time()
     misure = parse_vector_column(df['misure'])
     print(f"Total vector parsing completed in {time.time() - t_parse:.2f}s.")
@@ -87,14 +85,14 @@ def load_and_preprocess_data():
 class DialysisLSTMDataset(Dataset):
     def __init__(self, X, y, pids, timestamps, train_split_date, val_split_date, split_type, T):
         """
-        Custom Dataset that builds 3D sliding windows on the fly.
-        Ensures a window never contains data from more than one patient.
+        Dataset personalizzato per la costruzione on-the-fly di finestre temporali 3D.
+        Garantisce in modo stringente che nessuna finestra contenga dati di pazienti diversi.
         """
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
         self.T = T
         
-        # Determine train/val/test mask based on target timestamp position
+        # Split cronologico
         ts_series = pd.to_datetime(timestamps)
         if split_type == "train":
             mask = np.asarray(ts_series <= train_split_date)
@@ -105,12 +103,12 @@ class DialysisLSTMDataset(Dataset):
         else:
             raise ValueError(f"Unknown split_type: {split_type}")
             
-        # Vectorized check: verify if patient ID at index i matches patient ID at index i - (T - 1)
+        # Controllo di integrita del paziente:
+        # Verifica se l'ID del paziente all'indice i corrisponde a quello all'indice i - (T - 1)
         pids_arr = np.array(pids)
         same_patient = pids_arr[T - 1:] == pids_arr[:- (T - 1)]
         target_mask = mask[T - 1:]
         
-        # Combine filters to get global indices of valid sequence endpoints
         valid_flags = same_patient & target_mask
         self.valid_indices = np.where(valid_flags)[0] + (T - 1)
         
@@ -125,41 +123,35 @@ class DialysisLSTMDataset(Dataset):
 
 # --- 3. LSTM Neural Network Architectures ---
 class FlexibleLSTM(nn.Module):
-    def __init__(self, input_dim, arch_type="light", dropout_prob=0.0):
+    def __init__(self, input_dim, arch_type="light_32_1l"):
+        """
+        Architetture LSTM parametrizzate senza l'uso del Dropout, 
+        per testare differenti livelli di capacita rappresentativa su sequenze fisse T = 15.
+        """
         super().__init__()
         self.arch_type = arch_type
         
-        if arch_type == "light":
+        if arch_type == "light_32_1l":
             self.lstm = nn.LSTM(input_size=input_dim, hidden_size=32, num_layers=1, batch_first=True)
             self.fc = nn.Linear(32, 1)
             
-        elif arch_type == "deep":
-            self.lstm1 = nn.LSTM(input_size=input_dim, hidden_size=64, num_layers=1, batch_first=True)
-            self.lstm2 = nn.LSTM(input_size=64, hidden_size=32, num_layers=1, batch_first=True)
-            self.fc = nn.Linear(32, 1)
+        elif arch_type == "medium_64_2l":
+            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=64, num_layers=2, batch_first=True)
+            self.fc = nn.Linear(64, 1)
             
-        elif arch_type == "regularized":
+        elif arch_type == "wide_128_1l":
             self.lstm = nn.LSTM(input_size=input_dim, hidden_size=128, num_layers=1, batch_first=True)
-            self.dropout = nn.Dropout(dropout_prob)
+            self.fc = nn.Linear(128, 1)
+            
+        elif arch_type == "complex_128_2l":
+            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=128, num_layers=2, batch_first=True)
             self.fc = nn.Linear(128, 1)
 
     def forward(self, x):
-        if self.arch_type == "light":
-            lstm_out, _ = self.lstm(x)
-            last_timestep = lstm_out[:, -1, :]
-            return self.fc(last_timestep)
-            
-        elif self.arch_type == "deep":
-            out1, _ = self.lstm1(x)
-            out2, _ = self.lstm2(out1)
-            last_timestep = out2[:, -1, :]
-            return self.fc(last_timestep)
-            
-        elif self.arch_type == "regularized":
-            lstm_out, _ = self.lstm(x)
-            last_timestep = lstm_out[:, -1, :]
-            last_timestep = self.dropout(last_timestep)
-            return self.fc(last_timestep)
+        lstm_out, _ = self.lstm(x)
+        # Estrazione dell'ultimo passo temporale della finestra (T = 15)
+        last_timestep = lstm_out[:, -1, :]
+        return self.fc(last_timestep)
 
 # --- Early Stopping Helper ---
 class EarlyStopping:
@@ -190,15 +182,19 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
     train_losses = []
     val_losses = []
     val_maes = []
+    val_mapes = []
     test_losses = []
     test_maes = []
+    test_mapes = []
     
     best_val_loss = float('inf')
     best_val_mae = float('inf')
+    best_val_mape = float('inf')
     best_test_loss = float('inf')
     best_test_mae = float('inf')
+    best_test_mape = float('inf')
     
-    early_stopping = EarlyStopping(patience=20) # 20 Epochs of tolerance
+    early_stopping = EarlyStopping(patience=20)
     
     print(f"\n--- Training {model_name} on {device} ---")
     
@@ -220,22 +216,30 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
         epoch_train_loss /= len(train_loader.dataset)
         train_losses.append(epoch_train_loss)
         
-        # Validation and Test Evaluation steps
+        # Evaluation step
         model.eval()
         epoch_val_loss = 0.0
         epoch_val_mae = 0.0
+        epoch_val_mape = 0.0
         epoch_test_loss = 0.0
         epoch_test_mae = 0.0
+        epoch_test_mape = 0.0
         
         with torch.no_grad():
-            # Validate
+            # Validation
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 outputs = model(X_batch)
                 loss = criterion(outputs, y_batch)
                 epoch_val_loss += loss.item() * X_batch.size(0)
+                
+                # MAE in giorni
                 mae = torch.abs(outputs - y_batch).sum().item()
                 epoch_val_mae += mae
+                
+                # MAPE (con clamp preventivo del denominatore a minimo 1.0 giorno)
+                mape = (torch.abs(outputs - y_batch) / torch.clamp(y_batch, min=1.0)).sum().item()
+                epoch_val_mape += mape
                 
             # Test
             for X_batch, y_batch in test_loader:
@@ -243,29 +247,44 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
                 outputs = model(X_batch)
                 loss = criterion(outputs, y_batch)
                 epoch_test_loss += loss.item() * X_batch.size(0)
+                
+                # MAE in giorni
                 mae = torch.abs(outputs - y_batch).sum().item()
                 epoch_test_mae += mae
                 
+                # MAPE
+                mape = (torch.abs(outputs - y_batch) / torch.clamp(y_batch, min=1.0)).sum().item()
+                epoch_test_mape += mape
+                
         epoch_val_loss /= len(val_loader.dataset)
         epoch_val_mae /= len(val_loader.dataset)
+        epoch_val_mape = (epoch_val_mape / len(val_loader.dataset)) * 100.0
+        
         epoch_test_loss /= len(test_loader.dataset)
         epoch_test_mae /= len(test_loader.dataset)
+        epoch_test_mape = (epoch_test_mape / len(test_loader.dataset)) * 100.0
         
         val_losses.append(epoch_val_loss)
         val_maes.append(epoch_val_mae)
+        val_mapes.append(epoch_val_mape)
         test_losses.append(epoch_test_loss)
         test_maes.append(epoch_test_mae)
+        test_mapes.append(epoch_test_mape)
         
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
             best_val_mae = epoch_val_mae
+            best_val_mape = epoch_val_mape
             best_test_loss = epoch_test_loss
             best_test_mae = epoch_test_mae
+            best_test_mape = epoch_test_mape
             torch.save(model.state_dict(), f"best_weights_{model_name}.pth")
             
-        print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | Train MSE: {epoch_train_loss:.2f} | Val MSE: {epoch_val_loss:.2f} | Val MAE: {epoch_val_mae:.2f} days | Test MSE: {epoch_test_loss:.2f} | Test MAE: {epoch_test_mae:.2f} days")
+        print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | Train MSE: {epoch_train_loss:.2f} | "
+              f"Val MSE: {epoch_val_loss:.2f} | Val MAE: {epoch_val_mae:.2f} (MAPE: {epoch_val_mape:.2f}%) | "
+              f"Test MAE: {epoch_test_mae:.2f} (MAPE: {epoch_test_mape:.2f}%)")
         
-        # Check early stopping criterion on validation loss
+        # Early stopping basata sulla perdita di validazione
         early_stopping(epoch_val_loss)
         if early_stopping.early_stop:
             print(f"Early stopping triggered at epoch {epoch+1}. Restoring best model weights...")
@@ -274,17 +293,17 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
     if os.path.exists(f"best_weights_{model_name}.pth"):
         model.load_state_dict(torch.load(f"best_weights_{model_name}.pth"))
         
-    return train_losses, val_losses, val_maes, test_losses, test_maes, best_test_loss, best_test_mae, best_val_loss, best_val_mae
+    return train_losses, val_losses, val_maes, val_mapes, test_losses, test_maes, test_mapes, best_test_loss, best_test_mae, best_test_mape, best_val_loss, best_val_mae, best_val_mape
 
 # --- 5. Main Execution Pipeline ---
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using execution device: {device}")
     
-    # 1. Load Data (from CSV or Numpy Cache)
+    # 1. Load Data
     X_all, y_all, pid_all, time_all = load_and_preprocess_data()
     
-    # 2. Determine Chronological Split Points (50% training / 10% validation / 40% testing)
+    # 2. Determine Chronological Split Points (50% train / 10% val / 40% test)
     sorted_times = np.sort(time_all)
     train_split_idx = int(len(sorted_times) * 0.5)
     val_split_idx = int(len(sorted_times) * 0.6)
@@ -292,7 +311,7 @@ def main():
     val_split_date = pd.to_datetime(sorted_times[val_split_idx])
     print(f"Chronological split dates: Train <= {train_split_date} | Val <= {val_split_date} | Test > {val_split_date}")
     
-    # 3. Standardization based strictly on training statistics to prevent leakage
+    # 3. Standardization based on training statistics to prevent leakage
     print("\nStandardizing features based on training segment...")
     ts_series = pd.to_datetime(time_all)
     train_mask = ts_series <= train_split_date
@@ -307,18 +326,20 @@ def main():
     input_dim = X_scaled.shape[1]
     print(f"Input dimensions: {input_dim}")
     
-    # 4. Define the Three LSTM Architectures
+    # 4. Definizione delle quattro architetture da testare a finestra fissa T = 15 (1 mese)
+    # Rimosso completamente il dropout in tutti i modelli
     architectures = [
-        ("Architecture_1_Light", "light", 5, 0.0),
-        ("Architecture_2_Deep", "deep", 10, 0.0),
-        ("Architecture_3_Regularized", "regularized", 15, 0.2)
+        ("LSTM_Light_32_1L", "light_32_1l", 15),
+        ("LSTM_Medium_64_2L", "medium_64_2l", 15),
+        ("LSTM_Wide_128_1L", "wide_128_1l", 15),
+        ("LSTM_Complex_128_2L", "complex_128_2l", 15)
     ]
     
     results = {}
     plt.figure(figsize=(12, 8))
     
     # 5. Iterative Experimentation Loop
-    for name, arch_type, seq_len, dropout in architectures:
+    for name, arch_type, seq_len in architectures:
         print(f"\nConfiguring Dataset for {name} with Sequence Length T = {seq_len}...")
         
         train_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, time_all, train_split_date, val_split_date, split_type="train", T=seq_len)
@@ -331,11 +352,10 @@ def main():
         
         model = FlexibleLSTM(
             input_dim=input_dim,
-            arch_type=arch_type,
-            dropout_prob=dropout
+            arch_type=arch_type
         ).to(device)
         
-        train_hist, val_loss_hist, val_mae_hist, test_loss_hist, test_mae_hist, best_test_loss, best_test_mae, best_val_loss, best_val_mae = train_and_evaluate_lstm(
+        train_hist, val_loss_hist, val_mae_hist, val_mape_hist, test_loss_hist, test_mae_hist, test_mape_hist, best_test_loss, best_test_mae, best_test_mape, best_val_loss, best_val_mae, best_val_mape = train_and_evaluate_lstm(
             model, train_loader, val_loader, test_loader, name, device
         )
         
@@ -343,44 +363,48 @@ def main():
             "train_history": train_hist,
             "val_loss_history": val_loss_hist,
             "val_mae_history": val_mae_hist,
+            "val_mape_history": val_mape_hist,
             "test_loss_history": test_loss_hist,
             "test_mae_history": test_mae_hist,
+            "test_mape_history": test_mape_hist,
             "best_mse": best_test_loss,
             "best_rmse": np.sqrt(best_test_loss),
             "best_mae": best_test_mae,
-            "best_val_mae": best_val_mae
+            "best_mape": best_test_mape,
+            "best_val_mae": best_val_mae,
+            "best_val_mape": best_val_mape
         }
         
-        # Plot matches the exact length of test_mae_hist due to Early Stopping truncation
-        plt.plot(range(1, len(test_mae_hist) + 1), test_mae_hist, label=f"{name} (Best MAE: {best_test_mae:.2f})")
+        # Plot basato sull'andamento del Test MAPE (%) lungo le epoche (fino all'Early Stopping)
+        plt.plot(range(1, len(test_mape_hist) + 1), test_mape_hist, label=f"{name} (Best MAPE: {best_test_mape:.2f}%)")
         
-    # Styling evaluation plots
-    plt.title("LSTM Test MAE Loss Comparison Across Temporal Architectures (with Early Stopping)")
+    # Styling dei grafici
+    plt.title("LSTM Test MAPE (%) Comparison Across Architectural Configurations (Fixed T = 15, No Dropout)")
     plt.xlabel("Epoch")
-    plt.ylabel("Mean Absolute Error (MAE) in Days")
+    plt.ylabel("Mean Absolute Percentage Error (MAPE) in %")
     plt.legend()
     plt.grid(True, which="both", ls="--")
     plt.tight_layout()
-    plot_path = os.path.join(CACHE_DIR, "lstm_mae_comparison.png")
+    plot_path = os.path.join(CACHE_DIR, "lstm_mape_comparison.png")
     plt.savefig(plot_path)
-    print(f"\nMAE comparison curve plot saved to: {plot_path}")
+    print(f"\nMAPE comparison curve plot saved to: {plot_path}")
     
-    # 6. Final Experimental Evaluation Summary Table
-    print("\n" + "="*95)
-    print(f"{'LSTM Architecture Model':<30} | {'Best Val MAE':<12} | {'Best Test MSE':<13} | {'Best Test RMSE':<14} | {'Best Test MAE':<13}")
-    print("-"*95)
+    # 6. Tabella finale di riepilogo scientifico per la tesi
+    print("\n" + "="*125)
+    print(f"{'LSTM Architecture Model':<25} | {'Best Val MAE':<12} | {'Best Val MAPE':<13} | {'Best Test MSE':<13} | {'Best Test MAE':<13} | {'Best Test MAPE':<14}")
+    print("-"*125)
     best_model_name = None
-    best_rmse = float('inf')
+    best_mape = float('inf')
     
     for name, stats in results.items():
-        print(f"{name:<30} | {stats['best_val_mae']:<12.2f} | {stats['best_mse']:<13.2f} | {stats['best_rmse']:<14.2f} | {stats['best_mae']:<13.2f} days")
-        if stats['best_rmse'] < best_rmse:
-            best_rmse = stats['best_rmse']
+        print(f"{name:<25} | {stats['best_val_mae']:<12.2f} | {stats['best_val_mape']:<12.2f}% | {stats['best_mse']:<13.2f} | {stats['best_mae']:<13.2f} days | {stats['best_mape']:<13.2f}%")
+        if stats['best_mape'] < best_mape:
+            best_mape = stats['best_mape']
             best_model_name = name
             
-    print("="*95)
-    print(f"Recommended Best Sequential Architecture: {best_model_name} with RMSE of {best_rmse:.2f} days.")
-    print("="*95)
+    print("="*125)
+    print(f"Recommended Best Architectural Configuration (T=15): {best_model_name} with MAPE of {best_mape:.2f}%.")
+    print("="*125)
 
 if __name__ == "__main__":
     main()
