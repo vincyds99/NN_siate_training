@@ -18,16 +18,16 @@ PID_ALL_PATH = os.path.join(CACHE_DIR, "pid_all_lstm_misure.npy")
 TIME_ALL_PATH = os.path.join(CACHE_DIR, "time_all_lstm_misure.npy")
 
 EPOCHS = 500
-BATCH_SIZE = 256  # Batch size ottimizzato per ridurre l'overfitting
-LEARNING_RATE = 1e-4  # Ottimizzato (ridotto da 1e-3 a 1e-4) per sbloccare l'ottimizzatore dalle paludi della media
+BATCH_SIZE = 256  
+LEARNING_RATE = 1e-4  
 
 # --- 1. Custom MAPE Loss Function in PyTorch ---
 class MAPELoss(nn.Module):
     def __init__(self, min_val=10.0):
         """
         Loss Function personalizzata per il calcolo del Mean Absolute Percentage Error (MAPE).
-        Innalzato il min_val a 10.0 nel clamp di sicurezza a denominatore per ammortizzare
-        le penalità matematiche estreme quando il TTE reale si trova vicino allo zero.
+        Mantiene il clamp a 10.0 a denominatore per mitigare l'instabilità numerica
+        dei target prossimi allo zero.
         """
         super().__init__()
         self.min_val = min_val
@@ -181,7 +181,8 @@ class EarlyStopping:
 def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_name, device):
     criterion = MAPELoss() 
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    # Incrementato il weight_decay a 1e-3 per contrastare l'overfitting post-ottimo
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     
     train_losses = []  
@@ -210,6 +211,10 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
             
             loss = criterion(outputs, y_batch)
             loss.backward()
+            
+            # Introduzione del Gradient Clipping per stabilizzare le oscillazioni delle reti grandi
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             epoch_train_loss += loss.item() * X_batch.size(0)
@@ -288,7 +293,7 @@ def main():
     # 2. Ripartizione basata sui Pazienti (Patient-wise Split: 50% train / 10% val / 40% test)
     unique_pids = np.unique(pid_all)
     
-    # Utilizziamo un seed fisso per garantire la riproducibilità totale dello split
+    # Seed bloccato a 42 per garantire la riproducibilità dello split
     np.random.seed(42)
     shuffled_pids = unique_pids.copy()
     np.random.shuffle(shuffled_pids)
@@ -304,7 +309,7 @@ def main():
     print(f"\nPatient-wise split summary: Total Unique Patients = {n_patients}")
     print(f"Train: {len(train_pids)} patients | Val: {len(val_pids)} patients | Test: {len(test_pids)} patients")
     
-    # 3. Standardization basata esclusivamente sulle statistiche del blocco di addestramento
+    # 3. Standardization basata sul solo pool di addestramento per prevenire il data leakage
     print("\nStandardizing features based on training segment patients...")
     train_mask = np.isin(pid_all, train_pids)
     
