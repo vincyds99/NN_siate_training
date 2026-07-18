@@ -12,10 +12,10 @@ CSV_PATH = r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
 CACHE_DIR = r"c:\Users\vince\Desktop\NN"
 
 # Cache paths for the preprocessed LSTM pipeline (misure only)[cite: 11]
-X_ALL_PATH = os.path.join(CACHE_DIR, "X_all_lstm_no2017_misure.npy")
-Y_ALL_PATH = os.path.join(CACHE_DIR, "y_all_lstm_no2017_misure.npy")
-PID_ALL_PATH = os.path.join(CACHE_DIR, "pid_all_lstm_no2017_misure.npy")
-TIME_ALL_PATH = os.path.join(CACHE_DIR, "time_all_lstm_no2017_misure.npy")
+X_ALL_PATH = os.path.join(CACHE_DIR, "X_all_lstm_misure.npy")
+Y_ALL_PATH = os.path.join(CACHE_DIR, "y_all_lstm_misure.npy")
+PID_ALL_PATH = os.path.join(CACHE_DIR, "pid_all_lstm_misure.npy")
+TIME_ALL_PATH = os.path.join(CACHE_DIR, "time_all_lstm_misure.npy")
 
 EPOCHS = 500
 BATCH_SIZE = 256  # Batch size ottimizzato per ridurre l'overfitting[cite: 11]
@@ -60,11 +60,8 @@ def load_and_preprocess_data():
     df = pd.read_csv(CSV_PATH)
     print(f"Loaded CSV file in {time.time() - t_start:.2f}s. Initial row count: {len(df)}")
     
-    # Filtro anno 2017[cite: 11]
-    print("Filtering out rows from the year 2017...")
+    # Conversione timestamp in datetime
     df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df = df[df['timestamp'].dt.year != 2017].reset_index(drop=True)
-    print(f"Rows remaining after 2017 exclusion: {len(df)}")
     
     # Ordinamento cronologico per paziente[cite: 11]
     print("Sorting rows by patient_id and chronologically by timestamp...")
@@ -187,29 +184,38 @@ class EarlyStopping:
             self.best_loss = val_loss
             self.counter = 0
 
-# --- 5. Training and Evaluation Loop (Driven by MAPE Loss) ---
-def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_name, device):
-    # La Loss Function di addestramento è adesso il MAPE[cite: 11]
-    criterion = MAPELoss() 
-    
-    # Manteniamo l'ottimizzatore AdamW e lo scheduler Cosine Annealing[cite: 11]
+# --- 5. Training and Evaluation Loop ---
+def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_name, device, loss_type="mape"):
+    if loss_type == "mape":
+        criterion = MAPELoss() 
+    else:
+        criterion = nn.L1Loss()
+        
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     
-    train_losses = []  # Memorizzerà il MAPE di addestramento
-    val_losses = []    # Memorizzerà il MAPE di validazione (usato per l'Early Stopping)
+    train_losses = []  # Memorizzerà la perdita di addestramento primaria (MAPE o MAE)
+    val_losses = []    # Memorizzerà la perdita di validazione primaria
+    test_losses = []   # Memorizzerà la perdita di test primaria
+    
+    val_mapes = []
     val_maes = []
-    test_losses = []   # Memorizzerà il MAPE di test
+    test_mapes = []
     test_maes = []
     
-    best_val_loss = float('inf')  # Corrisponde al miglior MAPE di validazione
+    best_val_score = float('inf')
+    best_val_mape = float('inf')
     best_val_mae = float('inf')
-    best_test_loss = float('inf') # Corrisponde al miglior MAPE di test correlato
+    best_test_mape = float('inf')
     best_test_mae = float('inf')
     
     early_stopping = EarlyStopping(patience=20)
     
-    print(f"\n--- Training {model_name} on {device} ---")
+    print(f"\n--- Training {model_name} ({loss_type.upper()} loss) on {device} ---")
+    
+    # Per calcolare le metriche di monitoraggio secondarie
+    mape_metric = MAPELoss()
+    mae_metric = nn.L1Loss()
     
     for epoch in range(EPOCHS):
         model.train()
@@ -220,7 +226,6 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
             optimizer.zero_grad()
             outputs = model(X_batch)
             
-            # Calcolo della perdita basato su MAPE Loss[cite: 11]
             loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
@@ -233,66 +238,67 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
         
         # Evaluation step
         model.eval()
-        epoch_val_loss = 0.0  # MAPE di validazione
+        epoch_val_mape = 0.0
         epoch_val_mae = 0.0
-        epoch_test_loss = 0.0 # MAPE di test
+        epoch_test_mape = 0.0
         epoch_test_mae = 0.0
         
         with torch.no_grad():
-            # Validation[cite: 11]
+            # Validation
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 outputs = model(X_batch)
                 
-                loss = criterion(outputs, y_batch)
-                epoch_val_loss += loss.item() * X_batch.size(0)
+                epoch_val_mape += mape_metric(outputs, y_batch).item() * X_batch.size(0)
+                epoch_val_mae += mae_metric(outputs, y_batch).item() * X_batch.size(0)
                 
-                mae = torch.abs(outputs - y_batch).sum().item()
-                epoch_val_mae += mae
-                
-            # Test[cite: 11]
+            # Test
             for X_batch, y_batch in test_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 outputs = model(X_batch)
                 
-                loss = criterion(outputs, y_batch)
-                epoch_test_loss += loss.item() * X_batch.size(0)
+                epoch_test_mape += mape_metric(outputs, y_batch).item() * X_batch.size(0)
+                epoch_test_mae += mae_metric(outputs, y_batch).item() * X_batch.size(0)
                 
-                mae = torch.abs(outputs - y_batch).sum().item()
-                epoch_test_mae += mae
-                
-        epoch_val_loss /= len(val_loader.dataset)
+        epoch_val_mape /= len(val_loader.dataset)
         epoch_val_mae /= len(val_loader.dataset)
-        epoch_test_loss /= len(test_loader.dataset)
+        epoch_test_mape /= len(test_loader.dataset)
         epoch_test_mae /= len(test_loader.dataset)
         
-        val_losses.append(epoch_val_loss)
+        val_mapes.append(epoch_val_mape)
         val_maes.append(epoch_val_mae)
-        test_losses.append(epoch_test_loss)
+        test_mapes.append(epoch_test_mape)
         test_maes.append(epoch_test_mae)
         
-        # Salviamo i pesi migliori basandoci sul minor MAPE di validazione[cite: 11]
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
-            best_val_mae = epoch_val_mae
-            best_test_loss = epoch_test_loss
-            best_test_mae = epoch_test_mae
-            torch.save(model.state_dict(), f"best_weights_{model_name}.pth")
-            
-        print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | Train MAPE: {epoch_train_loss:.2f}% | "
-              f"Val MAPE: {epoch_val_loss:.2f}% (MAE: {epoch_val_mae:.2f}gg) | "
-              f"Test MAPE: {epoch_test_loss:.2f}% (MAE: {epoch_test_mae:.2f}gg)")
+        val_score = epoch_val_mape if loss_type == "mape" else epoch_val_mae
+        epoch_val_loss = epoch_val_mape if loss_type == "mape" else epoch_val_mae
+        epoch_test_loss = epoch_test_mape if loss_type == "mape" else epoch_test_mae
         
-        # L'Early Stopping monitora adesso la MAPE Loss di validazione[cite: 11]
-        early_stopping(epoch_val_loss)
+        val_losses.append(epoch_val_loss)
+        test_losses.append(epoch_test_loss)
+        
+        # Salviamo i pesi migliori basandoci sulla metrica di validazione primaria
+        if val_score < best_val_score:
+            best_val_score = val_score
+            best_val_mape = epoch_val_mape
+            best_val_mae = epoch_val_mae
+            best_test_mape = epoch_test_mape
+            best_test_mae = epoch_test_mae
+            torch.save(model.state_dict(), f"best_weights_{model_name}_{loss_type}.pth")
+            
+        print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | Train Loss ({loss_type.upper()}): {epoch_train_loss:.4f} | "
+              f"Val MAPE: {epoch_val_mape:.2f}% (MAE: {epoch_val_mae:.2f}gg) | "
+              f"Test MAPE: {epoch_test_mape:.2f}% (MAE: {epoch_test_mae:.2f}gg)")
+        
+        early_stopping(val_score)
         if early_stopping.early_stop:
             print(f"Early stopping triggered at epoch {epoch+1}. Restoring best model weights...")
             break
             
-    if os.path.exists(f"best_weights_{model_name}.pth"):
-        model.load_state_dict(torch.load(f"best_weights_{model_name}.pth"))
+    if os.path.exists(f"best_weights_{model_name}_{loss_type}.pth"):
+        model.load_state_dict(torch.load(f"best_weights_{model_name}_{loss_type}.pth"))
         
-    return train_losses, val_losses, val_maes, test_losses, test_maes, best_test_loss, best_test_mae, best_val_loss, best_val_mae
+    return train_losses, val_mapes, val_maes, test_mapes, test_maes, best_test_mape, best_test_mae, best_val_mape, best_val_mae
 
 # --- 6. Main Execution Pipeline ---
 def main():
@@ -333,72 +339,84 @@ def main():
         ("LSTM_Complex_128_2L", "complex_128_2l", 15)
     ]
     
-    results = {}
-    plt.figure(figsize=(12, 8))
-    
     # 5. Iterative Experimentation Loop[cite: 11]
-    for name, arch_type, seq_len in architectures:
-        print(f"\nConfiguring Dataset for {name} with Sequence Length T = {seq_len}...")
+    for loss_type in ["mape", "mae"]:
+        print(f"\n=======================================================================")
+        print(f" STARTING EXPERIMENT WITH LOSS TYPE: {loss_type.upper()}")
+        print(f"=======================================================================")
         
-        train_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, time_all, train_split_date, val_split_date, split_type="train", T=seq_len)
-        val_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, time_all, train_split_date, val_split_date, split_type="val", T=seq_len)
-        test_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, time_all, train_split_date, val_split_date, split_type="test", T=seq_len)
+        plt.figure(figsize=(12, 8))
+        results = {}
         
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-        
-        model = FlexibleLSTM(
-            input_dim=input_dim,
-            arch_type=arch_type
-        ).to(device)
-        
-        train_hist, val_loss_hist, val_mae_hist, test_loss_hist, test_mae_hist, best_test_loss, best_test_mae, best_val_loss, best_val_mae = train_and_evaluate_lstm(
-            model, train_loader, val_loader, test_loader, name, device
-        )
-        
-        results[name] = {
-            "train_history": train_hist,
-            "val_loss_history": val_loss_hist,
-            "val_mae_history": val_mae_hist,
-            "test_loss_history": test_loss_hist,
-            "test_mae_history": test_mae_hist,
-            "best_mape": best_test_loss,        # Best test MAPE [%]
-            "best_mae": best_test_mae,          # Best test MAE [giorni]
-            "best_val_mape": best_val_loss,    # Best val MAPE [%]
-            "best_val_mae": best_val_mae       # Best val MAE [giorni]
-        }
-        
-        # Plot dell'andamento della MAPE Loss (%) di test lungo le epoche[cite: 11]
-        plt.plot(range(1, len(test_loss_hist) + 1), test_loss_hist, label=f"{name} (Best Test MAPE: {best_test_loss:.2f}%)")
-        
-    # Styling dei grafici[cite: 11]
-    plt.title("LSTM Test MAPE (%) Training History under Native MAPE Loss Optimization (Fixed T = 15)")
-    plt.xlabel("Epoch")
-    plt.ylabel("Mean Absolute Percentage Error (MAPE) in %")
-    plt.legend()
-    plt.grid(True, which="both", ls="--")
-    plt.tight_layout()
-    plot_path = os.path.join(CACHE_DIR, "lstm_mape_loss_training.png")
-    plt.savefig(plot_path)
-    print(f"\nMAPE training curve plot saved to: {plot_path}")
-    
-    # 6. Tabella di riepilogo scientifico per il professore[cite: 11]
-    print("\n" + "="*110)
-    print(f"{'LSTM Architecture Model':<25} | {'Best Val MAPE':<15} | {'Best Val MAE':<15} | {'Best Test MAPE':<15} | {'Best Test MAE':<15}")
-    print("-"*110)
-    best_model_name = None
-    best_mape = float('inf')
-    
-    for name, stats in results.items():
-        print(f"{name:<25} | {stats['best_val_mape']:<14.2f}% | {stats['best_val_mae']:<12.2f} gg | {stats['best_mape']:<14.2f}% | {stats['best_mae']:<12.2f} gg")
-        if stats['best_mape'] < best_mape:
-            best_mape = stats['best_mape']
-            best_model_name = name
+        for name, arch_type, seq_len in architectures:
+            print(f"\nConfiguring Dataset for {name} with Sequence Length T = {seq_len}...")
             
-    print("="*110)
-    print(f"Recommended Best Architectural Configuration (T=15): {best_model_name} with MAPE of {best_mape:.2f}%.")
-    print("="*110)
+            train_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, time_all, train_split_date, val_split_date, split_type="train", T=seq_len)
+            val_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, time_all, train_split_date, val_split_date, split_type="val", T=seq_len)
+            test_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, time_all, train_split_date, val_split_date, split_type="test", T=seq_len)
+            
+            train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+            test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+            
+            model = FlexibleLSTM(
+                input_dim=input_dim,
+                arch_type=arch_type
+            ).to(device)
+            
+            train_hist, val_mape_hist, val_mae_hist, test_mape_hist, test_mae_hist, best_test_mape, best_test_mae, best_val_mape, best_val_mae = train_and_evaluate_lstm(
+                model, train_loader, val_loader, test_loader, name, device, loss_type=loss_type
+            )
+            
+            results[name] = {
+                "best_mape": best_test_mape,
+                "best_mae": best_test_mae,
+                "best_val_mape": best_val_mape,
+                "best_val_mae": best_val_mae
+            }
+            
+            if loss_type == "mape":
+                plt.plot(range(1, len(test_mape_hist) + 1), test_mape_hist, label=f"{name} (Best Test MAPE: {best_test_mape:.2f}%)")
+            else:
+                plt.plot(range(1, len(test_mae_hist) + 1), test_mae_hist, label=f"{name} (Best Test MAE: {best_test_mae:.2f} gg)")
+                
+        # Styling e salvataggio dei grafici
+        if loss_type == "mape":
+            plt.title("LSTM Test MAPE (%) Training History under Native MAPE Loss Optimization (Fixed T = 15)")
+            plt.xlabel("Epoch")
+            plt.ylabel("Mean Absolute Percentage Error (MAPE) in %")
+            plot_path = os.path.join(CACHE_DIR, "lstm_mape_loss_training.png")
+        else:
+            plt.title("LSTM Test MAE (giorni) Training History under Native MAE Loss Optimization (Fixed T = 15)")
+            plt.xlabel("Epoch")
+            plt.ylabel("Mean Absolute Error (MAE) in Days")
+            plot_path = os.path.join(CACHE_DIR, "lstm_mae_loss_training.png")
+            
+        plt.legend()
+        plt.grid(True, which="both", ls="--")
+        plt.tight_layout()
+        plt.savefig(plot_path)
+        print(f"\n{loss_type.upper()} training curve plot saved to: {plot_path}")
+        
+        # 6. Tabella di riepilogo scientifico per il professore[cite: 11]
+        print("\n" + "="*110)
+        print(f"Scientific Summary Table (Loss optimized: {loss_type.upper()})")
+        print(f"{'LSTM Architecture Model':<25} | {'Best Val MAPE':<15} | {'Best Val MAE':<15} | {'Best Test MAPE':<15} | {'Best Test MAE':<15}")
+        print("-"*110)
+        best_model_name = None
+        best_metric = float('inf')
+        
+        for name, stats in results.items():
+            print(f"{name:<25} | {stats['best_val_mape']:<14.2f}% | {stats['best_val_mae']:<12.2f} gg | {stats['best_mape']:<14.2f}% | {stats['best_mae']:<12.2f} gg")
+            metric_val = stats['best_mape'] if loss_type == "mape" else stats['best_mae']
+            if metric_val < best_metric:
+                best_metric = metric_val
+                best_model_name = name
+                
+        print("="*110)
+        unit = "%" if loss_type == "mape" else " gg"
+        print(f"Recommended Best Configuration for {loss_type.upper()} loss: {best_model_name} with {loss_type.upper()} of {best_metric:.2f}{unit}.")
+        print("="*110)
 
 if __name__ == "__main__":
     main()
