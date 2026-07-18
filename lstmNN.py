@@ -19,15 +19,15 @@ TIME_ALL_PATH = os.path.join(CACHE_DIR, "time_all_lstm_misure.npy")
 
 EPOCHS = 500
 BATCH_SIZE = 256  # Batch size ottimizzato per ridurre l'overfitting
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4  # Ottimizzato (ridotto da 1e-3 a 1e-4) per sbloccare l'ottimizzatore dalle paludi della media
 
 # --- 1. Custom MAPE Loss Function in PyTorch ---
 class MAPELoss(nn.Module):
-    def __init__(self, min_val=1.0):
+    def __init__(self, min_val=10.0):
         """
         Loss Function personalizzata per il calcolo del Mean Absolute Percentage Error (MAPE).
-        Include un clamp di sicurezza a denominatore per evitare divisioni per zero o amplificazioni
-        indebite dell'errore quando il TTE reale tende a zero.
+        Innalzato il min_val a 10.0 nel clamp di sicurezza a denominatore per ammortizzare
+        le penalità matematiche estreme quando il TTE reale si trova vicino allo zero.
         """
         super().__init__()
         self.min_val = min_val
