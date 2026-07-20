@@ -26,8 +26,8 @@ class MAPELoss(nn.Module):
     def __init__(self, min_val=10.0):
         """
         Loss Function personalizzata per il calcolo del Mean Absolute Percentage Error (MAPE).
-        Mantiene il clamp a 10.0 a denominatore per mitigare l'instabilità numerica
-        dei target prossimi allo zero.
+        Include un clamp di sicurezza a denominatore a 10.0 per ammortizzare le penalità
+        matematiche sui target vicini allo zero.
         """
         super().__init__()
         self.min_val = min_val
@@ -41,7 +41,7 @@ class MAPELoss(nn.Module):
 def load_and_preprocess_data():
     """
     Carica i vettori pre-elaborati se presenti in cache.
-    In caso contrario, esegue il parsing del CSV filtrando il 2017 e isolando la colonna 'misure'.
+    In caso contrario, esegue il parsing del CSV isolando la colonna 'misure'.
     """
     cache_exists = all(os.path.exists(p) for p in [X_ALL_PATH, Y_ALL_PATH, PID_ALL_PATH, TIME_ALL_PATH])
     
@@ -99,17 +99,13 @@ class DialysisLSTMDataset(Dataset):
     def __init__(self, X, y, pids, allowed_pids, T):
         """
         Dataset personalizzato per la costruzione on-the-fly di finestre temporali 3D.
-        Filtra le sequenze garantendo che appartengano unicamente ai pazienti inclusi
-        nello split corrente (Patient-wise Split).
+        Garantisce che le sequenze appartengano unicamente ai pazienti ammessi nello split.
         """
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
         self.T = T
         
-        # Creazione di una maschera per isolare i record associati ai pazienti ammessi
         mask = np.isin(pids, allowed_pids)
-            
-        # Controllo di integrità del paziente: la finestra non deve sovrapporsi tra ID differenti
         pids_arr = np.array(pids)
         same_patient = pids_arr[T - 1:] == pids_arr[:- (T - 1)]
         target_mask = mask[T - 1:]
@@ -126,36 +122,65 @@ class DialysisLSTMDataset(Dataset):
         y_target = self.y[target_idx]
         return X_seq, y_target
 
-# --- 4. LSTM Neural Network Architectures ---
-class FlexibleLSTM(nn.Module):
-    def __init__(self, input_dim, arch_type="light_32_1l"):
+# --- 4. Advanced LSTM Neural Network Architectures ---
+class AdvancedFlexibleLSTM(nn.Module):
+    def __init__(self, input_dim, arch_type="bilstm_32_1l"):
         """
-        Architetture LSTM parametrizzate senza l'uso del Dropout.
-        Mantiene una sliding window costante T = 15 (1 mese clinico).
+        Nuovo set di architetture avanzate senza Dropout (vincolo del professore).
+        Progettate per abbattere ulteriormente la MAPE Loss su T = 15.
         """
         super().__init__()
         self.arch_type = arch_type
         
-        if arch_type == "light_32_1l":
-            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=32, num_layers=1, batch_first=True)
-            self.fc = nn.Linear(32, 1)
-            
-        elif arch_type == "medium_64_2l":
-            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=64, num_layers=2, batch_first=True)
+        if arch_type == "bilstm_32_1l":
+            # LSTM Bidirezionale a 32 unita' per direzione (output size: 64)
+            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=32, num_layers=1, batch_first=True, bidirectional=True)
             self.fc = nn.Linear(64, 1)
             
-        elif arch_type == "wide_128_1l":
-            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=128, num_layers=1, batch_first=True)
-            self.fc = nn.Linear(128, 1)
+        elif arch_type == "pyramid_128_64_32_3l":
+            # Architettura a Piramide (128 -> 64 -> 32)
+            self.lstm1 = nn.LSTM(input_size=input_dim, hidden_size=128, num_layers=1, batch_first=True)
+            self.lstm2 = nn.LSTM(input_size=128, hidden_size=64, num_layers=1, batch_first=True)
+            self.lstm3 = nn.LSTM(input_size=64, hidden_size=32, num_layers=1, batch_first=True)
+            self.fc = nn.Linear(32, 1)
             
-        elif arch_type == "complex_128_2l":
-            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=128, num_layers=2, batch_first=True)
-            self.fc = nn.Linear(128, 1)
+        elif arch_type == "densehead_64_2l":
+            # LSTM a 2 strati con testata MLP non lineare (32 -> 16 -> 1)
+            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=64, num_layers=2, batch_first=True)
+            self.fc1 = nn.Linear(64, 16)
+            self.relu = nn.ReLU()
+            self.fc2 = nn.Linear(16, 1)
+            
+        elif arch_type == "layernorm_64_2l":
+            # LSTM a 2 strati stabilizzata da Layer Normalization
+            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=64, num_layers=2, batch_first=True)
+            self.ln = nn.LayerNorm(64)
+            self.fc = nn.Linear(64, 1)
 
     def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        last_timestep = lstm_out[:, -1, :]
-        return self.fc(last_timestep)
+        if self.arch_type == "pyramid_128_64_32_3l":
+            out1, _ = self.lstm1(x)
+            out2, _ = self.lstm2(out1)
+            out3, _ = self.lstm3(out2)
+            last_step = out3[:, -1, :]
+            return self.fc(last_step)
+            
+        elif self.arch_type == "densehead_64_2l":
+            lstm_out, _ = self.lstm(x)
+            last_step = lstm_out[:, -1, :]
+            h = self.relu(self.fc1(last_step))
+            return self.fc2(h)
+            
+        elif self.arch_type == "layernorm_64_2l":
+            lstm_out, _ = self.lstm(x)
+            last_step = lstm_out[:, -1, :]
+            norm_step = self.ln(last_step)
+            return self.fc(norm_step)
+            
+        else: # bilstm_32_1l
+            lstm_out, _ = self.lstm(x)
+            last_step = lstm_out[:, -1, :]
+            return self.fc(last_step)
 
 # --- Early Stopping Helper ---
 class EarlyStopping:
@@ -181,7 +206,6 @@ class EarlyStopping:
 def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_name, device):
     criterion = MAPELoss() 
     
-    # Incrementato il weight_decay a 1e-3 per contrastare l'overfitting post-ottimo
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     
@@ -212,7 +236,7 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
             loss = criterion(outputs, y_batch)
             loss.backward()
             
-            # Introduzione del Gradient Clipping per stabilizzare le oscillazioni delle reti grandi
+            # Gradient Clipping per prevenire sbalzi bruschi
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
@@ -290,10 +314,9 @@ def main():
     # 1. Load Data
     X_all, y_all, pid_all, time_all = load_and_preprocess_data()
     
-    # 2. Ripartizione basata sui Pazienti (Patient-wise Split: 50% train / 10% val / 40% test)
+    # 2. Patient-wise Split (50% train / 10% val / 40% test)
     unique_pids = np.unique(pid_all)
     
-    # Seed bloccato a 42 per garantire la riproducibilità dello split
     np.random.seed(42)
     shuffled_pids = unique_pids.copy()
     np.random.shuffle(shuffled_pids)
@@ -309,7 +332,7 @@ def main():
     print(f"\nPatient-wise split summary: Total Unique Patients = {n_patients}")
     print(f"Train: {len(train_pids)} patients | Val: {len(val_pids)} patients | Test: {len(test_pids)} patients")
     
-    # 3. Standardization basata sul solo pool di addestramento per prevenire il data leakage
+    # 3. Standardization basata sul solo pool di addestramento
     print("\nStandardizing features based on training segment patients...")
     train_mask = np.isin(pid_all, train_pids)
     
@@ -323,12 +346,12 @@ def main():
     input_dim = X_scaled.shape[1]
     print(f"Input dimensions: {input_dim}")
     
-    # 4. Configurazione delle 4 architetture con T = 15 fissa (1 mese) e NO Dropout
+    # 4. Configurazione delle 4 NUOVE architetture avanzate con T = 15 e NO Dropout
     architectures = [
-        ("LSTM_Light_32_1L", "light_32_1l", 15),
-        ("LSTM_Medium_64_2L", "medium_64_2l", 15),
-        ("LSTM_Wide_128_1L", "wide_128_1l", 15),
-        ("LSTM_Complex_128_2L", "complex_128_2l", 15)
+        ("LSTM_BiLSTM_32_1L", "bilstm_32_1l", 15),
+        ("LSTM_Pyramid_128_64_32_3L", "pyramid_128_64_32_3l", 15),
+        ("LSTM_DenseHead_64_2L", "densehead_64_2l", 15),
+        ("LSTM_LayerNorm_64_2L", "layernorm_64_2l", 15)
     ]
     
     results = {}
@@ -346,7 +369,7 @@ def main():
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
         
-        model = FlexibleLSTM(
+        model = AdvancedFlexibleLSTM(
             input_dim=input_dim,
             arch_type=arch_type
         ).to(device)
@@ -370,7 +393,7 @@ def main():
         plt.plot(range(1, len(test_loss_hist) + 1), test_loss_hist, label=f"{name} (Best Test MAPE: {best_test_loss:.2f}%)")
         
     # Styling dei grafici
-    plt.title("LSTM Test MAPE (%) Training History under Patient-wise Split (Fixed T = 15)")
+    plt.title("LSTM Test MAPE (%) Training History under Patient-wise Split (Advanced Architectures, Fixed T = 15)")
     plt.xlabel("Epoch")
     plt.ylabel("Mean Absolute Percentage Error (MAPE) in %")
     plt.legend()
