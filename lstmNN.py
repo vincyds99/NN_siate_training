@@ -18,17 +18,29 @@ PID_ALL_PATH = os.path.join(CACHE_DIR, "pid_all_lstm_misure.npy")
 TIME_ALL_PATH = os.path.join(CACHE_DIR, "time_all_lstm_misure.npy")
 
 EPOCHS = 500
+BATCH_SIZE = 128
+LEARNING_RATE = 5e-5
 
-# --- 1. Custom MAPE Loss Function in PyTorch ---
-class MAPELoss(nn.Module):
-    def __init__(self, min_val=10.0):
+# --- 1. Custom Hybrid Loss Function (MAPE + Weighted MAE) ---
+class HybridMAPEMAELoss(nn.Module):
+    def __init__(self, min_val=10.0, mae_weight=0.01):
+        """
+        Loss Ibrida: Calcola il MAPE con clamp a denominatore e vi aggiunge una
+        penalizzazione ponderata sull'errore assoluto medio (MAE) in giorni.
+        """
         super().__init__()
         self.min_val = min_val
+        self.mae_weight = mae_weight
 
     def forward(self, outputs, targets):
+        # Componente MAPE
         denom = torch.clamp(targets, min=self.min_val)
-        absolute_percentage_errors = torch.abs(outputs - targets) / denom
-        return torch.mean(absolute_percentage_errors) * 100.0
+        mape = torch.mean(torch.abs(outputs - targets) / denom) * 100.0
+        
+        # Componente MAE Ponderata
+        mae = torch.mean(torch.abs(outputs - targets))
+        
+        return mape + (self.mae_weight * mae)
 
 # --- 2. Data Preparation and Caching ---
 def load_and_preprocess_data():
@@ -80,12 +92,17 @@ def load_and_preprocess_data():
     
     return X_all, y_all, pid_all, time_all
 
-# --- 3. Custom Dataset for Sliding Window Temporal Ingestion ---
-class DialysisLSTMDataset(Dataset):
-    def __init__(self, X, y, pids, allowed_pids, T):
+# --- 3. Custom Dataset with Feature Delta Augmentation (Delta X) ---
+class EnhancedDialysisDataset(Dataset):
+    def __init__(self, X, y, pids, allowed_pids, T, use_deltas=True):
+        """
+        Costruisce finestre 3D aggiungendo opzionalmente le differenze prime (differenziali)
+        tra sedute consecutive, raddoppiando le feature da 26 a 52.
+        """
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
         self.T = T
+        self.use_deltas = use_deltas
         
         mask = np.isin(pids, allowed_pids)
         pids_arr = np.array(pids)
@@ -100,7 +117,14 @@ class DialysisLSTMDataset(Dataset):
 
     def __getitem__(self, idx):
         target_idx = self.valid_indices[idx]
-        X_seq = self.X[target_idx - self.T + 1 : target_idx + 1]
+        X_seq = self.X[target_idx - self.T + 1 : target_idx + 1]  # [T, 26]
+        
+        if self.use_deltas:
+            # Calcolo differenze prime temporali lungo la finestra T
+            deltas = torch.zeros_like(X_seq)
+            deltas[1:] = X_seq[1:] - X_seq[:-1]
+            X_seq = torch.cat([X_seq, deltas], dim=-1)  # [T, 52]
+            
         y_target = self.y[target_idx]
         return X_seq, y_target
 
@@ -109,7 +133,7 @@ class FixedBiLSTM(nn.Module):
     def __init__(self, input_dim):
         """
         Architettura fissa BiLSTM a 32 unita' per direzione (64 totali) con LayerNorm.
-        Senza Dropout (mantenendo la direttiva del professore).
+        Adattata dinamicamente alla dimensione delle feature (26 o 52).
         """
         super().__init__()
         self.lstm = nn.LSTM(input_size=input_dim, hidden_size=32, num_layers=1, batch_first=True, bidirectional=True)
@@ -127,7 +151,7 @@ class FixedBiLSTM(nn.Module):
 
 # --- Early Stopping Helper ---
 class EarlyStopping:
-    def __init__(self, patience=25, min_delta=0.0):
+    def __init__(self, patience=30, min_delta=0.0):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
@@ -145,21 +169,19 @@ class EarlyStopping:
             self.best_loss = val_loss
             self.counter = 0
 
-# --- 5. Flexible Training and Evaluation Loop ---
+# --- 5. Training Loop ---
 def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
-    criterion = MAPELoss(min_val=10.0) 
+    if exp_config["loss_type"] == "hybrid":
+        criterion = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.01)
+    else:
+        criterion = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.0)  # Pure MAPE
+        
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     
-    lr = exp_config['lr']
-    weight_decay = exp_config['weight_decay']
-    clip_norm = exp_config['clip_norm']
-    scheduler_type = exp_config['scheduler']
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    
-    if scheduler_type == "cosine":
+    if exp_config["scheduler"] == "warm_restarts":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=1)
+    else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-    elif scheduler_type == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     
     train_losses, val_losses, val_maes, test_losses, test_maes = [], [], [], [], []
     
@@ -168,7 +190,8 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
     best_test_loss = float('inf') 
     best_test_mae = float('inf')
     
-    early_stopping = EarlyStopping(patience=25)
+    early_stopping = EarlyStopping(patience=30)
+    eval_mape_calc = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.0)
     
     print(f"\n--- Training {exp_name} on {device} ---")
     
@@ -184,11 +207,12 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
             loss = criterion(outputs, y_batch)
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
             
             epoch_train_loss += loss.item() * X_batch.size(0)
             
+        scheduler.step()
         epoch_train_loss /= len(train_loader.dataset)
         train_losses.append(epoch_train_loss)
         
@@ -201,7 +225,7 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 outputs = model(X_batch)
                 
-                loss = criterion(outputs, y_batch)
+                loss = eval_mape_calc(outputs, y_batch)
                 epoch_val_loss += loss.item() * X_batch.size(0)
                 epoch_val_mae += torch.abs(outputs - y_batch).sum().item()
                 
@@ -209,7 +233,7 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 outputs = model(X_batch)
                 
-                loss = criterion(outputs, y_batch)
+                loss = eval_mape_calc(outputs, y_batch)
                 epoch_test_loss += loss.item() * X_batch.size(0)
                 epoch_test_mae += torch.abs(outputs - y_batch).sum().item()
                 
@@ -218,11 +242,6 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
         epoch_test_loss /= len(test_loader.dataset)
         epoch_test_mae /= len(test_loader.dataset)
         
-        if scheduler_type == "cosine":
-            scheduler.step()
-        elif scheduler_type == "plateau":
-            scheduler.step(epoch_val_loss)
-            
         val_losses.append(epoch_val_loss)
         val_maes.append(epoch_val_mae)
         test_losses.append(epoch_test_loss)
@@ -236,7 +255,7 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
             torch.save(model.state_dict(), f"best_weights_{exp_name}.pth")
             
         current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | LR: {current_lr:.1e} | Train MAPE: {epoch_train_loss:.2f}% | "
+        print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | LR: {current_lr:.1e} | Train Loss: {epoch_train_loss:.2f} | "
               f"Val MAPE: {epoch_val_loss:.2f}% (MAE: {epoch_val_mae:.2f}gg) | "
               f"Test MAPE: {epoch_test_loss:.2f}% (MAE: {epoch_test_mae:.2f}gg)")
         
@@ -277,43 +296,39 @@ def main():
     
     train_mask = np.isin(pid_all, train_pids)
     
-    # 3. Definiamo i 4 Esperimenti di Pipeline (Mantenendo SEMPRE la BiLSTM_32_1L)
+    # Standardization
+    mean = X_all[train_mask].mean(axis=0, keepdims=True)
+    std = X_all[train_mask].std(axis=0, keepdims=True)
+    std[std == 0] = 1.0
+    X_scaled = (X_all - mean) / std
+    
+    seq_len = 15
+    
+    # 3. Definiamo i 4 Esperimenti Avanzati sulla Pipeline della BiLSTM_32_1L
     experiments = [
         {
-            "name": "BiLSTM_32_1L_Baseline",
-            "scaling": "standard",
-            "batch_size": 256,
-            "lr": 1e-4,
-            "weight_decay": 1e-3,
-            "clip_norm": 1.0,
+            "name": "BiLSTM_32_1L_Winner_Baseline",
+            "use_deltas": False,
+            "loss_type": "pure_mape",
             "scheduler": "cosine"
         },
         {
-            "name": "BiLSTM_32_1L_PlateauScheduler",
-            "scaling": "standard",
-            "batch_size": 256,
-            "lr": 1e-4,
-            "weight_decay": 1e-3,
-            "clip_norm": 1.0,
-            "scheduler": "plateau"
-        },
-        {
-            "name": "BiLSTM_32_1L_RobustScaling",
-            "scaling": "robust",
-            "batch_size": 256,
-            "lr": 1e-4,
-            "weight_decay": 1e-3,
-            "clip_norm": 1.0,
+            "name": "BiLSTM_32_1L_FeatureDeltas_52Dim",
+            "use_deltas": True,
+            "loss_type": "pure_mape",
             "scheduler": "cosine"
         },
         {
-            "name": "BiLSTM_32_1L_Batch128_FineLR",
-            "scaling": "standard",
-            "batch_size": 128,
-            "lr": 5e-5,
-            "weight_decay": 1e-3,
-            "clip_norm": 0.5,
-            "scheduler": "plateau"
+            "name": "BiLSTM_32_1L_WarmRestarts",
+            "use_deltas": False,
+            "loss_type": "pure_mape",
+            "scheduler": "warm_restarts"
+        },
+        {
+            "name": "BiLSTM_32_1L_Deltas_HybridLoss",
+            "use_deltas": True,
+            "loss_type": "hybrid",
+            "scheduler": "warm_restarts"
         }
     ]
     
@@ -322,33 +337,17 @@ def main():
     
     for exp in experiments:
         name = exp["name"]
-        print(f"\nConfiguring Pipeline Experiment for {name}...")
+        print(f"\nConfiguring Advanced Pipeline Experiment for {name}...")
         
-        # Gestione Scaling
-        if exp["scaling"] == "standard":
-            mean = X_all[train_mask].mean(axis=0, keepdims=True)
-            std = X_all[train_mask].std(axis=0, keepdims=True)
-            std[std == 0] = 1.0
-            X_scaled = (X_all - mean) / std
-        elif exp["scaling"] == "robust":
-            median = np.median(X_all[train_mask], axis=0, keepdims=True)
-            q75, q25 = np.percentile(X_all[train_mask], [75, 25], axis=0, keepdims=True)
-            iqr = q75 - q25
-            iqr[iqr == 0] = 1.0
-            X_scaled = (X_all - median) / iqr
-            
-        input_dim = X_scaled.shape[1]
-        seq_len = 15
+        train_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, train_pids, T=seq_len, use_deltas=exp["use_deltas"])
+        val_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, val_pids, T=seq_len, use_deltas=exp["use_deltas"])
+        test_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, test_pids, T=seq_len, use_deltas=exp["use_deltas"])
         
-        train_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, train_pids, T=seq_len)
-        val_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, val_pids, T=seq_len)
-        test_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, test_pids, T=seq_len)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
         
-        train_loader = DataLoader(train_dataset, batch_size=exp["batch_size"], shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=exp["batch_size"], shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=exp["batch_size"], shuffle=False)
-        
-        # Architettura SEMPRE FISSA
+        input_dim = 52 if exp["use_deltas"] else 26
         model = FixedBiLSTM(input_dim=input_dim).to(device)
         
         train_hist, val_loss_hist, val_mae_hist, test_loss_hist, test_mae_hist, best_test_loss, best_test_mae, best_val_loss, best_val_mae = train_and_evaluate_bilstm(
@@ -369,7 +368,7 @@ def main():
         
         plt.plot(range(1, len(test_loss_hist) + 1), test_loss_hist, label=f"{name} (Best Test MAPE: {best_test_loss:.2f}%)")
         
-    plt.title("BiLSTM_32_1L Training Pipeline Experiments Test MAPE (%)")
+    plt.title("BiLSTM_32_1L Advanced Pipeline Enhancements Test MAPE (%)")
     plt.xlabel("Epoch")
     plt.ylabel("Mean Absolute Percentage Error (MAPE) in %")
     plt.legend()
@@ -380,13 +379,13 @@ def main():
     print(f"\nMAPE training curve plot saved to: {plot_path}")
     
     print("\n" + "="*110)
-    print(f"{'Pipeline Configuration Name':<35} | {'Best Val MAPE':<15} | {'Best Val MAE':<15} | {'Best Test MAPE':<15} | {'Best Test MAE':<15}")
+    print(f"{'Pipeline Configuration Name':<40} | {'Best Val MAPE':<15} | {'Best Val MAE':<15} | {'Best Test MAPE':<15} | {'Best Test MAE':<15}")
     print("-"*110)
     best_exp_name = None
     best_mape = float('inf')
     
     for name, stats in results.items():
-        print(f"{name:<35} | {stats['best_val_mape']:<14.2f}% | {stats['best_val_mae']:<12.2f} gg | {stats['best_mape']:<14.2f}% | {stats['best_mae']:<12.2f} gg")
+        print(f"{name:<40} | {stats['best_val_mape']:<14.2f}% | {stats['best_val_mae']:<12.2f} gg | {stats['best_mape']:<14.2f}% | {stats['best_mae']:<12.2f} gg")
         if stats['best_mape'] < best_mape:
             best_mape = stats['best_mape']
             best_exp_name = name
