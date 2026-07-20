@@ -18,17 +18,10 @@ PID_ALL_PATH = os.path.join(CACHE_DIR, "pid_all_lstm_misure.npy")
 TIME_ALL_PATH = os.path.join(CACHE_DIR, "time_all_lstm_misure.npy")
 
 EPOCHS = 500
-BATCH_SIZE = 256  
-LEARNING_RATE = 1e-4  
 
 # --- 1. Custom MAPE Loss Function in PyTorch ---
 class MAPELoss(nn.Module):
     def __init__(self, min_val=10.0):
-        """
-        Loss Function personalizzata per il calcolo del Mean Absolute Percentage Error (MAPE).
-        Include un clamp di sicurezza a denominatore a 10.0 per ammortizzare le penalità
-        matematiche sui target vicini allo zero.
-        """
         super().__init__()
         self.min_val = min_val
 
@@ -37,12 +30,8 @@ class MAPELoss(nn.Module):
         absolute_percentage_errors = torch.abs(outputs - targets) / denom
         return torch.mean(absolute_percentage_errors) * 100.0
 
-# --- 2. Data Preparation, Filtering and Caching ---
+# --- 2. Data Preparation and Caching ---
 def load_and_preprocess_data():
-    """
-    Carica i vettori pre-elaborati se presenti in cache.
-    In caso contrario, esegue il parsing del CSV isolando la colonna 'misure'.
-    """
     cache_exists = all(os.path.exists(p) for p in [X_ALL_PATH, Y_ALL_PATH, PID_ALL_PATH, TIME_ALL_PATH])
     
     if cache_exists:
@@ -60,10 +49,7 @@ def load_and_preprocess_data():
     df = pd.read_csv(CSV_PATH)
     print(f"Loaded CSV file in {time.time() - t_start:.2f}s. Initial row count: {len(df)}")
     
-    # Conversione timestamp in datetime
     df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    # Ordinamento cronologico per paziente
     print("Sorting rows by patient_id and chronologically by timestamp...")
     df = df.sort_values(by=['patient_id', 'timestamp']).reset_index(drop=True)
     
@@ -97,10 +83,6 @@ def load_and_preprocess_data():
 # --- 3. Custom Dataset for Sliding Window Temporal Ingestion ---
 class DialysisLSTMDataset(Dataset):
     def __init__(self, X, y, pids, allowed_pids, T):
-        """
-        Dataset personalizzato per la costruzione on-the-fly di finestre temporali 3D.
-        Garantisce che le sequenze appartengano unicamente ai pazienti ammessi nello split.
-        """
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
         self.T = T
@@ -122,69 +104,30 @@ class DialysisLSTMDataset(Dataset):
         y_target = self.y[target_idx]
         return X_seq, y_target
 
-# --- 4. Advanced LSTM Neural Network Architectures ---
-class AdvancedFlexibleLSTM(nn.Module):
-    def __init__(self, input_dim, arch_type="bilstm_32_1l"):
+# --- 4. FIXED WINNING ARCHITECTURE: LSTM_BiLSTM_32_1L ---
+class FixedBiLSTM(nn.Module):
+    def __init__(self, input_dim):
         """
-        Nuovo set di architetture avanzate senza Dropout (vincolo del professore).
-        Progettate per abbattere ulteriormente la MAPE Loss su T = 15.
+        Architettura fissa BiLSTM a 32 unita' per direzione (64 totali) con LayerNorm.
+        Senza Dropout (mantenendo la direttiva del professore).
         """
         super().__init__()
-        self.arch_type = arch_type
-        
-        if arch_type == "bilstm_32_1l":
-            # LSTM Bidirezionale a 32 unita' per direzione (output size: 64)
-            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=32, num_layers=1, batch_first=True, bidirectional=True)
-            self.fc = nn.Linear(64, 1)
-            
-        elif arch_type == "pyramid_128_64_32_3l":
-            # Architettura a Piramide (128 -> 64 -> 32)
-            self.lstm1 = nn.LSTM(input_size=input_dim, hidden_size=128, num_layers=1, batch_first=True)
-            self.lstm2 = nn.LSTM(input_size=128, hidden_size=64, num_layers=1, batch_first=True)
-            self.lstm3 = nn.LSTM(input_size=64, hidden_size=32, num_layers=1, batch_first=True)
-            self.fc = nn.Linear(32, 1)
-            
-        elif arch_type == "densehead_64_2l":
-            # LSTM a 2 strati con testata MLP non lineare (32 -> 16 -> 1)
-            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=64, num_layers=2, batch_first=True)
-            self.fc1 = nn.Linear(64, 16)
-            self.relu = nn.ReLU()
-            self.fc2 = nn.Linear(16, 1)
-            
-        elif arch_type == "layernorm_64_2l":
-            # LSTM a 2 strati stabilizzata da Layer Normalization
-            self.lstm = nn.LSTM(input_size=input_dim, hidden_size=64, num_layers=2, batch_first=True)
-            self.ln = nn.LayerNorm(64)
-            self.fc = nn.Linear(64, 1)
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=32, num_layers=1, batch_first=True, bidirectional=True)
+        self.head = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
 
     def forward(self, x):
-        if self.arch_type == "pyramid_128_64_32_3l":
-            out1, _ = self.lstm1(x)
-            out2, _ = self.lstm2(out1)
-            out3, _ = self.lstm3(out2)
-            last_step = out3[:, -1, :]
-            return self.fc(last_step)
-            
-        elif self.arch_type == "densehead_64_2l":
-            lstm_out, _ = self.lstm(x)
-            last_step = lstm_out[:, -1, :]
-            h = self.relu(self.fc1(last_step))
-            return self.fc2(h)
-            
-        elif self.arch_type == "layernorm_64_2l":
-            lstm_out, _ = self.lstm(x)
-            last_step = lstm_out[:, -1, :]
-            norm_step = self.ln(last_step)
-            return self.fc(norm_step)
-            
-        else: # bilstm_32_1l
-            lstm_out, _ = self.lstm(x)
-            last_step = lstm_out[:, -1, :]
-            return self.fc(last_step)
+        lstm_out, _ = self.lstm(x)
+        last_step = lstm_out[:, -1, :]
+        return self.head(last_step)
 
 # --- Early Stopping Helper ---
 class EarlyStopping:
-    def __init__(self, patience=20, min_delta=0.0):
+    def __init__(self, patience=25, min_delta=0.0):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
@@ -202,27 +145,32 @@ class EarlyStopping:
             self.best_loss = val_loss
             self.counter = 0
 
-# --- 5. Training and Evaluation Loop (Driven by MAPE Loss) ---
-def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_name, device):
-    criterion = MAPELoss() 
+# --- 5. Flexible Training and Evaluation Loop ---
+def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
+    criterion = MAPELoss(min_val=10.0) 
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    lr = exp_config['lr']
+    weight_decay = exp_config['weight_decay']
+    clip_norm = exp_config['clip_norm']
+    scheduler_type = exp_config['scheduler']
     
-    train_losses = []  
-    val_losses = []    
-    val_maes = []
-    test_losses = []   
-    test_maes = []
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    if scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    elif scheduler_type == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    
+    train_losses, val_losses, val_maes, test_losses, test_maes = [], [], [], [], []
     
     best_val_loss = float('inf')  
     best_val_mae = float('inf')
     best_test_loss = float('inf') 
     best_test_mae = float('inf')
     
-    early_stopping = EarlyStopping(patience=20)
+    early_stopping = EarlyStopping(patience=25)
     
-    print(f"\n--- Training {model_name} on {device} ---")
+    print(f"\n--- Training {exp_name} on {device} ---")
     
     for epoch in range(EPOCHS):
         model.train()
@@ -236,23 +184,17 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
             loss = criterion(outputs, y_batch)
             loss.backward()
             
-            # Gradient Clipping per prevenire sbalzi bruschi
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
             optimizer.step()
             
             epoch_train_loss += loss.item() * X_batch.size(0)
             
-        scheduler.step()
         epoch_train_loss /= len(train_loader.dataset)
         train_losses.append(epoch_train_loss)
         
         # Evaluation step
         model.eval()
-        epoch_val_loss = 0.0  
-        epoch_val_mae = 0.0
-        epoch_test_loss = 0.0 
-        epoch_test_mae = 0.0
+        epoch_val_loss, epoch_val_mae, epoch_test_loss, epoch_test_mae = 0.0, 0.0, 0.0, 0.0
         
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
@@ -261,9 +203,7 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
                 
                 loss = criterion(outputs, y_batch)
                 epoch_val_loss += loss.item() * X_batch.size(0)
-                
-                mae = torch.abs(outputs - y_batch).sum().item()
-                epoch_val_mae += mae
+                epoch_val_mae += torch.abs(outputs - y_batch).sum().item()
                 
             for X_batch, y_batch in test_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
@@ -271,15 +211,18 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
                 
                 loss = criterion(outputs, y_batch)
                 epoch_test_loss += loss.item() * X_batch.size(0)
-                
-                mae = torch.abs(outputs - y_batch).sum().item()
-                epoch_test_mae += mae
+                epoch_test_mae += torch.abs(outputs - y_batch).sum().item()
                 
         epoch_val_loss /= len(val_loader.dataset)
         epoch_val_mae /= len(val_loader.dataset)
         epoch_test_loss /= len(test_loader.dataset)
         epoch_test_mae /= len(test_loader.dataset)
         
+        if scheduler_type == "cosine":
+            scheduler.step()
+        elif scheduler_type == "plateau":
+            scheduler.step(epoch_val_loss)
+            
         val_losses.append(epoch_val_loss)
         val_maes.append(epoch_val_mae)
         test_losses.append(epoch_test_loss)
@@ -290,9 +233,10 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
             best_val_mae = epoch_val_mae
             best_test_loss = epoch_test_loss
             best_test_mae = epoch_test_mae
-            torch.save(model.state_dict(), f"best_weights_{model_name}.pth")
+            torch.save(model.state_dict(), f"best_weights_{exp_name}.pth")
             
-        print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | Train MAPE: {epoch_train_loss:.2f}% | "
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | LR: {current_lr:.1e} | Train MAPE: {epoch_train_loss:.2f}% | "
               f"Val MAPE: {epoch_val_loss:.2f}% (MAE: {epoch_val_mae:.2f}gg) | "
               f"Test MAPE: {epoch_test_loss:.2f}% (MAE: {epoch_test_mae:.2f}gg)")
         
@@ -301,8 +245,8 @@ def train_and_evaluate_lstm(model, train_loader, val_loader, test_loader, model_
             print(f"Early stopping triggered at epoch {epoch+1}. Restoring best model weights...")
             break
             
-    if os.path.exists(f"best_weights_{model_name}.pth"):
-        model.load_state_dict(torch.load(f"best_weights_{model_name}.pth"))
+    if os.path.exists(f"best_weights_{exp_name}.pth"):
+        model.load_state_dict(torch.load(f"best_weights_{exp_name}.pth"))
         
     return train_losses, val_losses, val_maes, test_losses, test_maes, best_test_loss, best_test_mae, best_val_loss, best_val_mae
 
@@ -316,7 +260,6 @@ def main():
     
     # 2. Patient-wise Split (50% train / 10% val / 40% test)
     unique_pids = np.unique(pid_all)
-    
     np.random.seed(42)
     shuffled_pids = unique_pids.copy()
     np.random.shuffle(shuffled_pids)
@@ -332,50 +275,84 @@ def main():
     print(f"\nPatient-wise split summary: Total Unique Patients = {n_patients}")
     print(f"Train: {len(train_pids)} patients | Val: {len(val_pids)} patients | Test: {len(test_pids)} patients")
     
-    # 3. Standardization basata sul solo pool di addestramento
-    print("\nStandardizing features based on training segment patients...")
     train_mask = np.isin(pid_all, train_pids)
     
-    mean = X_all[train_mask].mean(axis=0, keepdims=True)
-    std = X_all[train_mask].std(axis=0, keepdims=True)
-    std[std == 0] = 1.0
-    
-    X_scaled = (X_all - mean) / std
-    print("Features normalized cleanly (Mean = 0, Std = 1).")
-    
-    input_dim = X_scaled.shape[1]
-    print(f"Input dimensions: {input_dim}")
-    
-    # 4. Configurazione delle 4 NUOVE architetture avanzate con T = 15 e NO Dropout
-    architectures = [
-        ("LSTM_BiLSTM_32_1L", "bilstm_32_1l", 15),
-        ("LSTM_Pyramid_128_64_32_3L", "pyramid_128_64_32_3l", 15),
-        ("LSTM_DenseHead_64_2L", "densehead_64_2l", 15),
-        ("LSTM_LayerNorm_64_2L", "layernorm_64_2l", 15)
+    # 3. Definiamo i 4 Esperimenti di Pipeline (Mantenendo SEMPRE la BiLSTM_32_1L)
+    experiments = [
+        {
+            "name": "BiLSTM_32_1L_Baseline",
+            "scaling": "standard",
+            "batch_size": 256,
+            "lr": 1e-4,
+            "weight_decay": 1e-3,
+            "clip_norm": 1.0,
+            "scheduler": "cosine"
+        },
+        {
+            "name": "BiLSTM_32_1L_PlateauScheduler",
+            "scaling": "standard",
+            "batch_size": 256,
+            "lr": 1e-4,
+            "weight_decay": 1e-3,
+            "clip_norm": 1.0,
+            "scheduler": "plateau"
+        },
+        {
+            "name": "BiLSTM_32_1L_RobustScaling",
+            "scaling": "robust",
+            "batch_size": 256,
+            "lr": 1e-4,
+            "weight_decay": 1e-3,
+            "clip_norm": 1.0,
+            "scheduler": "cosine"
+        },
+        {
+            "name": "BiLSTM_32_1L_Batch128_FineLR",
+            "scaling": "standard",
+            "batch_size": 128,
+            "lr": 5e-5,
+            "weight_decay": 1e-3,
+            "clip_norm": 0.5,
+            "scheduler": "plateau"
+        }
     ]
     
     results = {}
     plt.figure(figsize=(12, 8))
     
-    # 5. Iterative Experimentation Loop
-    for name, arch_type, seq_len in architectures:
-        print(f"\nConfiguring Dataset for {name} with Sequence Length T = {seq_len}...")
+    for exp in experiments:
+        name = exp["name"]
+        print(f"\nConfiguring Pipeline Experiment for {name}...")
+        
+        # Gestione Scaling
+        if exp["scaling"] == "standard":
+            mean = X_all[train_mask].mean(axis=0, keepdims=True)
+            std = X_all[train_mask].std(axis=0, keepdims=True)
+            std[std == 0] = 1.0
+            X_scaled = (X_all - mean) / std
+        elif exp["scaling"] == "robust":
+            median = np.median(X_all[train_mask], axis=0, keepdims=True)
+            q75, q25 = np.percentile(X_all[train_mask], [75, 25], axis=0, keepdims=True)
+            iqr = q75 - q25
+            iqr[iqr == 0] = 1.0
+            X_scaled = (X_all - median) / iqr
+            
+        input_dim = X_scaled.shape[1]
+        seq_len = 15
         
         train_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, train_pids, T=seq_len)
         val_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, val_pids, T=seq_len)
         test_dataset = DialysisLSTMDataset(X_scaled, y_all, pid_all, test_pids, T=seq_len)
         
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=exp["batch_size"], shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=exp["batch_size"], shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=exp["batch_size"], shuffle=False)
         
-        model = AdvancedFlexibleLSTM(
-            input_dim=input_dim,
-            arch_type=arch_type
-        ).to(device)
+        # Architettura SEMPRE FISSA
+        model = FixedBiLSTM(input_dim=input_dim).to(device)
         
-        train_hist, val_loss_hist, val_mae_hist, test_loss_hist, test_mae_hist, best_test_loss, best_test_mae, best_val_loss, best_val_mae = train_and_evaluate_lstm(
-            model, train_loader, val_loader, test_loader, name, device
+        train_hist, val_loss_hist, val_mae_hist, test_loss_hist, test_mae_hist, best_test_loss, best_test_mae, best_val_loss, best_val_mae = train_and_evaluate_bilstm(
+            model, train_loader, val_loader, test_loader, exp, name, device
         )
         
         results[name] = {
@@ -392,8 +369,7 @@ def main():
         
         plt.plot(range(1, len(test_loss_hist) + 1), test_loss_hist, label=f"{name} (Best Test MAPE: {best_test_loss:.2f}%)")
         
-    # Styling dei grafici
-    plt.title("LSTM Test MAPE (%) Training History under Patient-wise Split (Advanced Architectures, Fixed T = 15)")
+    plt.title("BiLSTM_32_1L Training Pipeline Experiments Test MAPE (%)")
     plt.xlabel("Epoch")
     plt.ylabel("Mean Absolute Percentage Error (MAPE) in %")
     plt.legend()
@@ -403,21 +379,20 @@ def main():
     plt.savefig(plot_path)
     print(f"\nMAPE training curve plot saved to: {plot_path}")
     
-    # 6. Tabella di riepilogo scientifico per il professore
     print("\n" + "="*110)
-    print(f"{'LSTM Architecture Model':<25} | {'Best Val MAPE':<15} | {'Best Val MAE':<15} | {'Best Test MAPE':<15} | {'Best Test MAE':<15}")
+    print(f"{'Pipeline Configuration Name':<35} | {'Best Val MAPE':<15} | {'Best Val MAE':<15} | {'Best Test MAPE':<15} | {'Best Test MAE':<15}")
     print("-"*110)
-    best_model_name = None
+    best_exp_name = None
     best_mape = float('inf')
     
     for name, stats in results.items():
-        print(f"{name:<25} | {stats['best_val_mape']:<14.2f}% | {stats['best_val_mae']:<12.2f} gg | {stats['best_mape']:<14.2f}% | {stats['best_mae']:<12.2f} gg")
+        print(f"{name:<35} | {stats['best_val_mape']:<14.2f}% | {stats['best_val_mae']:<12.2f} gg | {stats['best_mape']:<14.2f}% | {stats['best_mae']:<12.2f} gg")
         if stats['best_mape'] < best_mape:
             best_mape = stats['best_mape']
-            best_model_name = name
+            best_exp_name = name
             
     print("="*110)
-    print(f"Recommended Best Architectural Configuration (T=15): {best_model_name} with MAPE of {best_mape:.2f}%.")
+    print(f"Recommended Best Pipeline Setup: {best_exp_name} with Test MAPE of {best_mape:.2f}%.")
     print("="*110)
 
 if __name__ == "__main__":
