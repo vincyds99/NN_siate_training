@@ -97,7 +97,7 @@ class EnhancedDialysisDataset(Dataset):
     def __init__(self, X, y, pids, allowed_pids, T, use_deltas=True):
         """
         Costruisce finestre 3D aggiungendo opzionalmente le differenze prime (differenziali)
-        tra sedute consecutive, raddoppiando le feature da 26 a 52.
+        tra sedute consecutive, raddoppiando il numero delle feature.
         """
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
@@ -117,13 +117,13 @@ class EnhancedDialysisDataset(Dataset):
 
     def __getitem__(self, idx):
         target_idx = self.valid_indices[idx]
-        X_seq = self.X[target_idx - self.T + 1 : target_idx + 1]  # [T, 26]
+        X_seq = self.X[target_idx - self.T + 1 : target_idx + 1]  # [T, feature_dim]
         
         if self.use_deltas:
             # Calcolo differenze prime temporali lungo la finestra T
             deltas = torch.zeros_like(X_seq)
             deltas[1:] = X_seq[1:] - X_seq[:-1]
-            X_seq = torch.cat([X_seq, deltas], dim=-1)  # [T, 52]
+            X_seq = torch.cat([X_seq, deltas], dim=-1)  # [T, feature_dim * 2]
             
         y_target = self.y[target_idx]
         return X_seq, y_target
@@ -133,7 +133,7 @@ class FixedBiLSTM(nn.Module):
     def __init__(self, input_dim):
         """
         Architettura fissa BiLSTM a 32 unita' per direzione (64 totali) con LayerNorm.
-        Adattata dinamicamente alla dimensione delle feature (26 o 52).
+        Adattata dinamicamente alla dimensione delle feature in ingresso.
         """
         super().__init__()
         self.lstm = nn.LSTM(input_size=input_dim, hidden_size=32, num_layers=1, batch_first=True, bidirectional=True)
@@ -347,7 +347,8 @@ def main():
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
         
-        input_dim = 52 if exp["use_deltas"] else 26
+        num_features = X_scaled.shape[1]
+        input_dim = num_features * 2 if exp["use_deltas"] else num_features
         model = FixedBiLSTM(input_dim=input_dim).to(device)
         
         train_hist, val_loss_hist, val_mae_hist, test_loss_hist, test_mae_hist, best_test_loss, best_test_mae, best_val_loss, best_val_mae = train_and_evaluate_bilstm(
