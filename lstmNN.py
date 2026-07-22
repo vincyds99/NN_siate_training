@@ -36,8 +36,8 @@ class MAPELoss(nn.Module):
 class HybridMAPEMAELoss(nn.Module):
     def __init__(self, min_val=10.0, mae_weight=0.01):
         """
-        Loss Ibrida: Calcola il MAPE con clamp a denominatore e vi aggiunge una
-        penalizzazione ponderata sull'errore assoluto medio (MAE) in giorni.
+        Hybrid Loss: Calculates MAPE with denominator clamping and adds a
+        weighted penalty on mean absolute error (MAE) in days.
         """
         super().__init__()
         self.min_val = min_val
@@ -137,7 +137,7 @@ class EnhancedDialysisDataset(Dataset):
 class FixedBiLSTM(nn.Module):
     def __init__(self, input_dim):
         """
-        Architettura BiLSTM a 32 unita' per direzione (64 totali) con LayerNorm.
+        BiLSTM Architecture with 32 units per direction (64 total) with LayerNorm.
         """
         super().__init__()
         self.lstm = nn.LSTM(input_size=input_dim, hidden_size=32, num_layers=1, batch_first=True, bidirectional=True)
@@ -178,8 +178,8 @@ class EarlyStopping:
 # --- Evaluation Function ---
 def evaluate_dataset(model, data_loader, device):
     """
-    Esegue la valutazione formale e pura su un DataLoader (Validation o Test Set).
-    Restituisce MAPE (%) e MAE (giorni).
+    Performs formal evaluation on a DataLoader (Validation or Test Set).
+    Returns MAPE (%) and MAE (days).
     """
     model.eval()
     mape_criterion = MAPELoss(min_val=10.0)
@@ -247,11 +247,11 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
         epoch_train_loss /= len(train_loader.dataset)
         train_losses.append(epoch_train_loss)
         
-        # Validazione a fine epoca
+        # Validation at epoch end
         val_mape, val_mae = evaluate_dataset(model, val_loader, device)
         val_mape_hist.append(val_mape)
         
-        # Checkpointing basato sulla Validation Loss
+        # Checkpointing based on Validation Loss
         if val_mape < best_val_loss:
             best_val_loss = val_mape
             torch.save(model.state_dict(), weights_path)
@@ -262,18 +262,18 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
         
         early_stopping(val_mape)
         if early_stopping.early_stop:
-            print(f"Early stopping attivato all'epoca {epoch+1}.")
+            print(f"Early stopping triggered at epoch {epoch+1}.")
             break
             
-    # --- VALUTAZIONE FORMALE SUL TEST SET FINALE ---
-    print(f"\n[EVALUATION] Caricamento pesi ottimali da '{weights_path}' per la valutazione sul Test Set...")
+    # --- FORMAL EVALUATION ON FINAL TEST SET ---
+    print(f"\n[EVALUATION] Loading optimal weights from '{weights_path}' for evaluation on Test Set...")
     if os.path.exists(weights_path):
         model.load_state_dict(torch.load(weights_path))
         
     final_test_mape, final_test_mae = evaluate_dataset(model, test_loader, device)
     final_val_mape, final_val_mae = evaluate_dataset(model, val_loader, device)
     
-    print(f"--> [RISULTATO TEST SET FORMALE] {exp_name} | MAPE: {final_test_mape:.2f}% | MAE: {final_test_mae:.2f} giorni")
+    print(f"--> [FORMAL TEST SET RESULT] {exp_name} | MAPE: {final_test_mape:.2f}% | MAE: {final_test_mae:.2f} days")
     
     return val_mape_hist, final_val_mape, final_val_mae, final_test_mape, final_test_mae
 
@@ -313,7 +313,7 @@ def main():
     
     seq_len = 15
     
-    # 3. Definiamo i 4 Esperimenti di Pipeline
+    # 3. Define the 4 Pipeline Experiments
     experiments = [
         {
             "name": "BiLSTM_32_1L_Winner_Baseline",
@@ -366,37 +366,37 @@ def main():
         
         val_histories[name] = val_mape_hist
         results.append({
-            "Architettura / Pipeline": name,
+            "Architecture / Pipeline": name,
             "Val MAPE (%)": round(val_mape, 2),
-            "Val MAE (gg)": round(val_mae, 2),
+            "Val MAE (days)": round(val_mae, 2),
             "Test MAPE (%)": round(test_mape, 2),
-            "Test MAE (gg)": round(test_mae, 2)
+            "Test MAE (days)": round(test_mae, 2)
         })
         
-    # --- 1. GENERAZIONE TABELLA FINALE ---
+    # --- 1. GENERATE FINAL TABLE ---
     df_results = pd.DataFrame(results)
     
     print("\n" + "="*95)
-    print(" TABELLA FINALE VALUTAZIONE PERFORMANCE SUL TEST SET (Richiesta Professore)")
+    print(" FINAL TEST SET PERFORMANCE EVALUATION TABLE")
     print("="*95)
     print(df_results.to_string(index=False))
     print("="*95)
     
-    # Salvataggio tabella in CSV
+    # Save table to CSV
     csv_out_path = os.path.join(CACHE_DIR, "final_test_performance.csv")
     df_results.to_csv(csv_out_path, index=False)
-    print(f"\nTabella dei risultati salvata in CSV: {csv_out_path}")
+    print(f"\nResults table saved to CSV: {csv_out_path}")
     
-    # --- 2. GRAFICO 1: BAR CHART DEL TEST MAPE FINALE (Da mostrare al professore) ---
+    # --- 2. PLOT 1: FINAL TEST MAPE BAR CHART ---
     plt.figure(figsize=(10, 6))
-    bars = plt.bar(df_results["Architettura / Pipeline"], df_results["Test MAPE (%)"], color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
-    plt.title("Valutazione Finale Performance sul Test Set (Test MAPE %)", fontsize=14, fontweight='bold')
+    bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAPE (%)"], color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
+    plt.title("Final Performance Evaluation on Test Set (Test MAPE %)", fontsize=14, fontweight='bold')
     plt.ylabel("Mean Absolute Percentage Error (MAPE) in %", fontsize=12)
     plt.xticks(rotation=15, ha="right", fontsize=10)
     plt.ylim(50, 90)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     
-    # Aggiungi etichette con i valori numerici sopra ogni barra
+    # Add numeric labels above each bar
     for bar in bars:
         yval = bar.get_height()
         plt.text(bar.get_x() + bar.get_width()/2.0, yval + 0.8, f"{yval:.2f}%", ha='center', va='bottom', fontweight='bold')
@@ -404,22 +404,22 @@ def main():
     plt.tight_layout()
     bar_plot_path = os.path.join(CACHE_DIR, "final_test_mape_comparison.png")
     plt.savefig(bar_plot_path)
-    print(f"Grafico a barre delle performance salvato in: {bar_plot_path}")
+    print(f"Performance bar chart saved to: {bar_plot_path}")
     
-    # --- 3. GRAFICO 2: CURVE DI APPRENDIMENTO IN VALIDAZIONE ---
+    # --- 3. PLOT 2: VALIDATION LEARNING CURVES ---
     plt.figure(figsize=(12, 7))
     for name, hist in val_histories.items():
         plt.plot(range(1, len(hist) + 1), hist, label=f"{name}")
         
-    plt.title("Curve di Validazione per Epoca (Validation MAPE %)", fontsize=14)
-    plt.xlabel("Epoca", fontsize=12)
+    plt.title("Validation Curves per Epoch (Validation MAPE %)", fontsize=14)
+    plt.xlabel("Epoch", fontsize=12)
     plt.ylabel("Validation MAPE (%)", fontsize=12)
     plt.legend()
     plt.grid(True, ls="--")
     plt.tight_layout()
     curve_plot_path = os.path.join(CACHE_DIR, "val_mape_learning_curves.png")
     plt.savefig(curve_plot_path)
-    print(f"Grafico curve di validazione salvato in: {curve_plot_path}")
+    print(f"Validation learning curves plot saved to: {curve_plot_path}")
 
 if __name__ == "__main__":
     main()
