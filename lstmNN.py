@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 CSV_PATH = r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
 CACHE_DIR = r"c:\Users\vince\Desktop\NN"
 
-# Cache paths for the preprocessed LSTM pipeline (misure only)
+# Cache paths for the preprocessed LSTM pipeline
 X_ALL_PATH = os.path.join(CACHE_DIR, "X_all_lstm_misure.npy")
 Y_ALL_PATH = os.path.join(CACHE_DIR, "y_all_lstm_misure.npy")
 PID_ALL_PATH = os.path.join(CACHE_DIR, "pid_all_lstm_misure.npy")
@@ -21,7 +21,18 @@ EPOCHS = 500
 BATCH_SIZE = 128
 LEARNING_RATE = 5e-5
 
-# --- 1. Custom Hybrid Loss Function (MAPE + Weighted MAE) ---
+# --- 1. Custom Loss Functions ---
+class MAPELoss(nn.Module):
+    def __init__(self, min_val=10.0):
+        super().__init__()
+        self.min_val = min_val
+
+    def forward(self, outputs, targets):
+        denom = torch.clamp(targets, min=self.min_val)
+        absolute_percentage_errors = torch.abs(outputs - targets) / denom
+        return torch.mean(absolute_percentage_errors) * 100.0
+
+
 class HybridMAPEMAELoss(nn.Module):
     def __init__(self, min_val=10.0, mae_weight=0.01):
         """
@@ -33,14 +44,11 @@ class HybridMAPEMAELoss(nn.Module):
         self.mae_weight = mae_weight
 
     def forward(self, outputs, targets):
-        # Componente MAPE
         denom = torch.clamp(targets, min=self.min_val)
         mape = torch.mean(torch.abs(outputs - targets) / denom) * 100.0
-        
-        # Componente MAE Ponderata
         mae = torch.mean(torch.abs(outputs - targets))
-        
         return mape + (self.mae_weight * mae)
+
 
 # --- 2. Data Preparation and Caching ---
 def load_and_preprocess_data():
@@ -92,13 +100,10 @@ def load_and_preprocess_data():
     
     return X_all, y_all, pid_all, time_all
 
+
 # --- 3. Custom Dataset with Feature Delta Augmentation (Delta X) ---
 class EnhancedDialysisDataset(Dataset):
     def __init__(self, X, y, pids, allowed_pids, T, use_deltas=True):
-        """
-        Costruisce finestre 3D aggiungendo opzionalmente le differenze prime (differenziali)
-        tra sedute consecutive, raddoppiando il numero delle feature.
-        """
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
         self.T = T
@@ -117,23 +122,22 @@ class EnhancedDialysisDataset(Dataset):
 
     def __getitem__(self, idx):
         target_idx = self.valid_indices[idx]
-        X_seq = self.X[target_idx - self.T + 1 : target_idx + 1]  # [T, feature_dim]
+        X_seq = self.X[target_idx - self.T + 1 : target_idx + 1]
         
         if self.use_deltas:
-            # Calcolo differenze prime temporali lungo la finestra T
             deltas = torch.zeros_like(X_seq)
             deltas[1:] = X_seq[1:] - X_seq[:-1]
-            X_seq = torch.cat([X_seq, deltas], dim=-1)  # [T, feature_dim * 2]
+            X_seq = torch.cat([X_seq, deltas], dim=-1)
             
         y_target = self.y[target_idx]
         return X_seq, y_target
 
-# --- 4. FIXED WINNING ARCHITECTURE: LSTM_BiLSTM_32_1L ---
+
+# --- 4. FIXED ARCHITECTURE: BiLSTM_32_1L ---
 class FixedBiLSTM(nn.Module):
     def __init__(self, input_dim):
         """
-        Architettura fissa BiLSTM a 32 unita' per direzione (64 totali) con LayerNorm.
-        Adattata dinamicamente alla dimensione delle feature in ingresso.
+        Architettura BiLSTM a 32 unita' per direzione (64 totali) con LayerNorm.
         """
         super().__init__()
         self.lstm = nn.LSTM(input_size=input_dim, hidden_size=32, num_layers=1, batch_first=True, bidirectional=True)
@@ -148,6 +152,7 @@ class FixedBiLSTM(nn.Module):
         lstm_out, _ = self.lstm(x)
         last_step = lstm_out[:, -1, :]
         return self.head(last_step)
+
 
 # --- Early Stopping Helper ---
 class EarlyStopping:
@@ -169,12 +174,43 @@ class EarlyStopping:
             self.best_loss = val_loss
             self.counter = 0
 
+
+# --- Evaluation Function ---
+def evaluate_dataset(model, data_loader, device):
+    """
+    Esegue la valutazione formale e pura su un DataLoader (Validation o Test Set).
+    Restituisce MAPE (%) e MAE (giorni).
+    """
+    model.eval()
+    mape_criterion = MAPELoss(min_val=10.0)
+    total_mape = 0.0
+    total_mae = 0.0
+    total_samples = 0
+    
+    with torch.no_grad():
+        for X_batch, y_batch in data_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            
+            mape_val = mape_criterion(outputs, y_batch)
+            mae_val = torch.abs(outputs - y_batch).sum()
+            
+            batch_size = X_batch.size(0)
+            total_mape += mape_val.item() * batch_size
+            total_mae += mae_val.item()
+            total_samples += batch_size
+            
+    avg_mape = total_mape / total_samples
+    avg_mae = total_mae / total_samples
+    return avg_mape, avg_mae
+
+
 # --- 5. Training Loop ---
 def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
     if exp_config["loss_type"] == "hybrid":
-        criterion = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.01)
+        train_criterion = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.01)
     else:
-        criterion = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.0)  # Pure MAPE
+        train_criterion = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.0)
         
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     
@@ -183,15 +219,10 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     
-    train_losses, val_losses, val_maes, test_losses, test_maes = [], [], [], [], []
-    
-    best_val_loss = float('inf')  
-    best_val_mae = float('inf')
-    best_test_loss = float('inf') 
-    best_test_mae = float('inf')
-    
+    train_losses, val_mape_hist = [], []
+    best_val_loss = float('inf')
     early_stopping = EarlyStopping(patience=30)
-    eval_mape_calc = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.0)
+    weights_path = f"best_weights_{exp_name}.pth"
     
     print(f"\n--- Training {exp_name} on {device} ---")
     
@@ -204,7 +235,7 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
             optimizer.zero_grad()
             outputs = model(X_batch)
             
-            loss = criterion(outputs, y_batch)
+            loss = train_criterion(outputs, y_batch)
             loss.backward()
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
@@ -216,58 +247,36 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
         epoch_train_loss /= len(train_loader.dataset)
         train_losses.append(epoch_train_loss)
         
-        # Evaluation step
-        model.eval()
-        epoch_val_loss, epoch_val_mae, epoch_test_loss, epoch_test_mae = 0.0, 0.0, 0.0, 0.0
+        # Validazione a fine epoca
+        val_mape, val_mae = evaluate_dataset(model, val_loader, device)
+        val_mape_hist.append(val_mape)
         
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                outputs = model(X_batch)
-                
-                loss = eval_mape_calc(outputs, y_batch)
-                epoch_val_loss += loss.item() * X_batch.size(0)
-                epoch_val_mae += torch.abs(outputs - y_batch).sum().item()
-                
-            for X_batch, y_batch in test_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                outputs = model(X_batch)
-                
-                loss = eval_mape_calc(outputs, y_batch)
-                epoch_test_loss += loss.item() * X_batch.size(0)
-                epoch_test_mae += torch.abs(outputs - y_batch).sum().item()
-                
-        epoch_val_loss /= len(val_loader.dataset)
-        epoch_val_mae /= len(val_loader.dataset)
-        epoch_test_loss /= len(test_loader.dataset)
-        epoch_test_mae /= len(test_loader.dataset)
-        
-        val_losses.append(epoch_val_loss)
-        val_maes.append(epoch_val_mae)
-        test_losses.append(epoch_test_loss)
-        test_maes.append(epoch_test_mae)
-        
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
-            best_val_mae = epoch_val_mae
-            best_test_loss = epoch_test_loss
-            best_test_mae = epoch_test_mae
-            torch.save(model.state_dict(), f"best_weights_{exp_name}.pth")
+        # Checkpointing basato sulla Validation Loss
+        if val_mape < best_val_loss:
+            best_val_loss = val_mape
+            torch.save(model.state_dict(), weights_path)
             
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | LR: {current_lr:.1e} | Train Loss: {epoch_train_loss:.2f} | "
-              f"Val MAPE: {epoch_val_loss:.2f}% (MAE: {epoch_val_mae:.2f}gg) | "
-              f"Test MAPE: {epoch_test_loss:.2f}% (MAE: {epoch_test_mae:.2f}gg)")
+              f"Val MAPE: {val_mape:.2f}% (Best Val: {best_val_loss:.2f}%)")
         
-        early_stopping(epoch_val_loss)
+        early_stopping(val_mape)
         if early_stopping.early_stop:
-            print(f"Early stopping triggered at epoch {epoch+1}. Restoring best model weights...")
+            print(f"Early stopping attivato all'epoca {epoch+1}.")
             break
             
-    if os.path.exists(f"best_weights_{exp_name}.pth"):
-        model.load_state_dict(torch.load(f"best_weights_{exp_name}.pth"))
+    # --- VALUTAZIONE FORMALE SUL TEST SET FINALE ---
+    print(f"\n[EVALUATION] Caricamento pesi ottimali da '{weights_path}' per la valutazione sul Test Set...")
+    if os.path.exists(weights_path):
+        model.load_state_dict(torch.load(weights_path))
         
-    return train_losses, val_losses, val_maes, test_losses, test_maes, best_test_loss, best_test_mae, best_val_loss, best_val_mae
+    final_test_mape, final_test_mae = evaluate_dataset(model, test_loader, device)
+    final_val_mape, final_val_mae = evaluate_dataset(model, val_loader, device)
+    
+    print(f"--> [RISULTATO TEST SET FORMALE] {exp_name} | MAPE: {final_test_mape:.2f}% | MAE: {final_test_mae:.2f} giorni")
+    
+    return val_mape_hist, final_val_mape, final_val_mae, final_test_mape, final_test_mae
+
 
 # --- 6. Main Execution Pipeline ---
 def main():
@@ -304,7 +313,7 @@ def main():
     
     seq_len = 15
     
-    # 3. Definiamo i 4 Esperimenti Avanzati sulla Pipeline della BiLSTM_32_1L
+    # 3. Definiamo i 4 Esperimenti di Pipeline
     experiments = [
         {
             "name": "BiLSTM_32_1L_Winner_Baseline",
@@ -313,7 +322,7 @@ def main():
             "scheduler": "cosine"
         },
         {
-            "name": "BiLSTM_32_1L_FeatureDeltas_52Dim",
+            "name": "BiLSTM_32_1L_FeatureDeltas",
             "use_deltas": True,
             "loss_type": "pure_mape",
             "scheduler": "cosine"
@@ -332,12 +341,12 @@ def main():
         }
     ]
     
-    results = {}
-    plt.figure(figsize=(12, 8))
+    results = []
+    val_histories = {}
     
     for exp in experiments:
         name = exp["name"]
-        print(f"\nConfiguring Advanced Pipeline Experiment for {name}...")
+        print(f"\nConfiguring Experiment: {name}...")
         
         train_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, train_pids, T=seq_len, use_deltas=exp["use_deltas"])
         val_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, val_pids, T=seq_len, use_deltas=exp["use_deltas"])
@@ -351,49 +360,66 @@ def main():
         input_dim = num_features * 2 if exp["use_deltas"] else num_features
         model = FixedBiLSTM(input_dim=input_dim).to(device)
         
-        train_hist, val_loss_hist, val_mae_hist, test_loss_hist, test_mae_hist, best_test_loss, best_test_mae, best_val_loss, best_val_mae = train_and_evaluate_bilstm(
+        val_mape_hist, val_mape, val_mae, test_mape, test_mae = train_and_evaluate_bilstm(
             model, train_loader, val_loader, test_loader, exp, name, device
         )
         
-        results[name] = {
-            "train_history": train_hist,
-            "val_loss_history": val_loss_hist,
-            "val_mae_history": val_mae_hist,
-            "test_loss_history": test_loss_hist,
-            "test_mae_history": test_mae_hist,
-            "best_mape": best_test_loss,        
-            "best_mae": best_test_mae,          
-            "best_val_mape": best_val_loss,    
-            "best_val_mae": best_val_mae       
-        }
+        val_histories[name] = val_mape_hist
+        results.append({
+            "Architettura / Pipeline": name,
+            "Val MAPE (%)": round(val_mape, 2),
+            "Val MAE (gg)": round(val_mae, 2),
+            "Test MAPE (%)": round(test_mape, 2),
+            "Test MAE (gg)": round(test_mae, 2)
+        })
         
-        plt.plot(range(1, len(test_loss_hist) + 1), test_loss_hist, label=f"{name} (Best Test MAPE: {best_test_loss:.2f}%)")
+    # --- 1. GENERAZIONE TABELLA FINALE ---
+    df_results = pd.DataFrame(results)
+    
+    print("\n" + "="*95)
+    print(" TABELLA FINALE VALUTAZIONE PERFORMANCE SUL TEST SET (Richiesta Professore)")
+    print("="*95)
+    print(df_results.to_string(index=False))
+    print("="*95)
+    
+    # Salvataggio tabella in CSV
+    csv_out_path = os.path.join(CACHE_DIR, "final_test_performance.csv")
+    df_results.to_csv(csv_out_path, index=False)
+    print(f"\nTabella dei risultati salvata in CSV: {csv_out_path}")
+    
+    # --- 2. GRAFICO 1: BAR CHART DEL TEST MAPE FINALE (Da mostrare al professore) ---
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(df_results["Architettura / Pipeline"], df_results["Test MAPE (%)"], color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
+    plt.title("Valutazione Finale Performance sul Test Set (Test MAPE %)", fontsize=14, fontweight='bold')
+    plt.ylabel("Mean Absolute Percentage Error (MAPE) in %", fontsize=12)
+    plt.xticks(rotation=15, ha="right", fontsize=10)
+    plt.ylim(50, 90)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # Aggiungi etichette con i valori numerici sopra ogni barra
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2.0, yval + 0.8, f"{yval:.2f}%", ha='center', va='bottom', fontweight='bold')
         
-    plt.title("BiLSTM_32_1L Advanced Pipeline Enhancements Test MAPE (%)")
-    plt.xlabel("Epoch")
-    plt.ylabel("Mean Absolute Percentage Error (MAPE) in %")
-    plt.legend()
-    plt.grid(True, which="both", ls="--")
     plt.tight_layout()
-    plot_path = os.path.join(CACHE_DIR, "lstm_mape_loss_training.png")
-    plt.savefig(plot_path)
-    print(f"\nMAPE training curve plot saved to: {plot_path}")
+    bar_plot_path = os.path.join(CACHE_DIR, "final_test_mape_comparison.png")
+    plt.savefig(bar_plot_path)
+    print(f"Grafico a barre delle performance salvato in: {bar_plot_path}")
     
-    print("\n" + "="*110)
-    print(f"{'Pipeline Configuration Name':<40} | {'Best Val MAPE':<15} | {'Best Val MAE':<15} | {'Best Test MAPE':<15} | {'Best Test MAE':<15}")
-    print("-"*110)
-    best_exp_name = None
-    best_mape = float('inf')
-    
-    for name, stats in results.items():
-        print(f"{name:<40} | {stats['best_val_mape']:<14.2f}% | {stats['best_val_mae']:<12.2f} gg | {stats['best_mape']:<14.2f}% | {stats['best_mae']:<12.2f} gg")
-        if stats['best_mape'] < best_mape:
-            best_mape = stats['best_mape']
-            best_exp_name = name
-            
-    print("="*110)
-    print(f"Recommended Best Pipeline Setup: {best_exp_name} with Test MAPE of {best_mape:.2f}%.")
-    print("="*110)
+    # --- 3. GRAFICO 2: CURVE DI APPRENDIMENTO IN VALIDAZIONE ---
+    plt.figure(figsize=(12, 7))
+    for name, hist in val_histories.items():
+        plt.plot(range(1, len(hist) + 1), hist, label=f"{name}")
+        
+    plt.title("Curve di Validazione per Epoca (Validation MAPE %)", fontsize=14)
+    plt.xlabel("Epoca", fontsize=12)
+    plt.ylabel("Validation MAPE (%)", fontsize=12)
+    plt.legend()
+    plt.grid(True, ls="--")
+    plt.tight_layout()
+    curve_plot_path = os.path.join(CACHE_DIR, "val_mape_learning_curves.png")
+    plt.savefig(curve_plot_path)
+    print(f"Grafico curve di validazione salvato in: {curve_plot_path}")
 
 if __name__ == "__main__":
     main()
