@@ -311,7 +311,9 @@ def main():
     std[std == 0] = 1.0
     X_scaled = (X_all - mean) / std
     
-    seq_len = 15
+    # --- SLIDING WINDOW SET TO 25 SESSIONS ---
+    seq_len = 25
+    print(f"Sliding window length configured to T = {seq_len} sessions.")
     
     # 3. Define the 4 Pipeline Experiments
     experiments = [
@@ -377,20 +379,20 @@ def main():
     df_results = pd.DataFrame(results)
     
     print("\n" + "="*95)
-    print(" FINAL TEST SET PERFORMANCE EVALUATION TABLE")
+    print(f" FINAL TEST SET PERFORMANCE EVALUATION TABLE (T = {seq_len} SESSIONS)")
     print("="*95)
     print(df_results.to_string(index=False))
     print("="*95)
     
     # Save table to CSV
-    csv_out_path = os.path.join(CACHE_DIR, "final_test_performance.csv")
+    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_T{seq_len}.csv")
     df_results.to_csv(csv_out_path, index=False)
     print(f"\nResults table saved to CSV: {csv_out_path}")
     
     # --- 2. PLOT 1: FINAL TEST MAPE BAR CHART ---
     plt.figure(figsize=(10, 6))
     bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAPE (%)"], color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
-    plt.title("Final Performance Evaluation on Test Set (Test MAPE %)", fontsize=14, fontweight='bold')
+    plt.title(f"Final Performance Evaluation on Test Set (T = {seq_len} Sessions)", fontsize=14, fontweight='bold')
     plt.ylabel("Mean Absolute Percentage Error (MAPE) in %", fontsize=12)
     plt.xticks(rotation=15, ha="right", fontsize=10)
     plt.ylim(50, 90)
@@ -402,7 +404,7 @@ def main():
         plt.text(bar.get_x() + bar.get_width()/2.0, yval + 0.8, f"{yval:.2f}%", ha='center', va='bottom', fontweight='bold')
         
     plt.tight_layout()
-    bar_plot_path = os.path.join(CACHE_DIR, "final_test_mape_comparison.png")
+    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mape_comparison_T{seq_len}.png")
     plt.savefig(bar_plot_path)
     print(f"Performance bar chart saved to: {bar_plot_path}")
     
@@ -411,13 +413,13 @@ def main():
     for name, hist in val_histories.items():
         plt.plot(range(1, len(hist) + 1), hist, label=f"{name}")
         
-    plt.title("Validation Curves per Epoch (Validation MAPE %)", fontsize=14)
+    plt.title(f"Validation Curves per Epoch (Validation MAPE %) - T = {seq_len} Sessions", fontsize=14)
     plt.xlabel("Epoch", fontsize=12)
     plt.ylabel("Validation MAPE (%)", fontsize=12)
     plt.legend()
     plt.grid(True, ls="--")
     plt.tight_layout()
-    curve_plot_path = os.path.join(CACHE_DIR, "val_mape_learning_curves.png")
+    curve_plot_path = os.path.join(CACHE_DIR, f"val_mape_learning_curves_T{seq_len}.png")
     plt.savefig(curve_plot_path)
     print(f"Validation learning curves plot saved to: {curve_plot_path}")
 
