@@ -8,18 +8,17 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
 # --- Configurations ---
-CSV_PATH = r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
+DEFAULT_CSV = r"c:\Users\vince\Desktop\NN\Datasets\NN_training_dataset_44misure_cap400.csv"
+CSV_PATH = DEFAULT_CSV if os.path.exists(DEFAULT_CSV) else r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
 CACHE_DIR = r"c:\Users\vince\Desktop\NN"
-
-# Cache paths for the preprocessed LSTM pipeline
-X_ALL_PATH = os.path.join(CACHE_DIR, "X_all_lstm_misure.npy")
-Y_ALL_PATH = os.path.join(CACHE_DIR, "y_all_lstm_misure.npy")
-PID_ALL_PATH = os.path.join(CACHE_DIR, "pid_all_lstm_misure.npy")
-TIME_ALL_PATH = os.path.join(CACHE_DIR, "time_all_lstm_misure.npy")
 
 EPOCHS = 500
 BATCH_SIZE = 128
 LEARNING_RATE = 5e-5
+
+# Split Configuration: "per_patient_temporal" (60% past / 40% future per patient)
+# or "global_temporal" (60% earliest overall / 40% latest overall)
+SPLIT_MODE = "per_patient_temporal"
 
 # --- 1. Custom Loss Functions ---
 class MAPELoss(nn.Module):
@@ -50,21 +49,9 @@ class HybridMAPEMAELoss(nn.Module):
         return mape + (self.mae_weight * mae)
 
 
-# --- 2. Data Preparation and Caching ---
+# --- 2. Data Preparation ---
 def load_and_preprocess_data():
-    cache_exists = all(os.path.exists(p) for p in [X_ALL_PATH, Y_ALL_PATH, PID_ALL_PATH, TIME_ALL_PATH])
-    
-    if cache_exists:
-        print("Loading preprocessed dataset from LSTM numpy cache files...")
-        t0 = time.time()
-        X_all = np.load(X_ALL_PATH, allow_pickle=True)
-        y_all = np.load(Y_ALL_PATH)
-        pid_all = np.load(PID_ALL_PATH, allow_pickle=True)
-        time_all = np.load(TIME_ALL_PATH, allow_pickle=True)
-        print(f"Loaded datasets from cache in {time.time() - t0:.2f} seconds.")
-        return X_all, y_all, pid_all, time_all
-
-    print(f"Cache files not found. Parsing CSV file: {CSV_PATH}")
+    print(f"Parsing CSV file: {CSV_PATH}")
     t_start = time.time()
     df = pd.read_csv(CSV_PATH)
     print(f"Loaded CSV file in {time.time() - t_start:.2f}s. Initial row count: {len(df)}")
@@ -91,28 +78,75 @@ def load_and_preprocess_data():
     pid_all = df['patient_id'].values
     time_all = df['timestamp'].values
     
-    print("Caching global preprocessed arrays for LSTM...")
-    np.save(X_ALL_PATH, X_all)
-    np.save(Y_ALL_PATH, y_all)
-    np.save(PID_ALL_PATH, pid_all)
-    np.save(TIME_ALL_PATH, time_all)
-    print("Preprocessed dataset successfully saved to cache.")
-    
     return X_all, y_all, pid_all, time_all
 
 
-# --- 3. Custom Dataset with Feature Delta Augmentation (Delta X) ---
+# --- 3. Temporal Patient-wise Dataset Split Function ---
+def create_temporal_split_masks(pid_all, time_all, train_ratio=0.5, val_ratio=0.1, mode="per_patient_temporal"):
+    """
+    Creates boolean masks for Train (50%), Validation (10%), and Test (40%) splits
+    respecting chronological timestamp ordering.
+    """
+    n_samples = len(pid_all)
+    train_mask = np.zeros(n_samples, dtype=bool)
+    val_mask = np.zeros(n_samples, dtype=bool)
+    test_mask = np.zeros(n_samples, dtype=bool)
+
+    if mode == "per_patient_temporal":
+        print("Executing Per-Patient Chronological Temporal Split (60% past / 40% future per patient)...")
+        unique_pids = np.unique(pid_all)
+        
+        for pid in unique_pids:
+            p_indices = np.where(pid_all == pid)[0]
+            n_p = len(p_indices)
+            
+            n_train = int(n_p * train_ratio)
+            n_val = int(n_p * val_ratio)
+            
+            train_idx_p = p_indices[:n_train]
+            val_idx_p = p_indices[n_train : n_train + n_val]
+            test_idx_p = p_indices[n_train + n_val :]
+            
+            train_mask[train_idx_p] = True
+            val_mask[val_idx_p] = True
+            test_mask[test_idx_p] = True
+
+    elif mode == "global_temporal":
+        print("Executing Global Timestamp Cutoff Split (60% earliest overall / 40% latest overall)...")
+        sorted_indices = np.argsort(time_all)
+        
+        n_train = int(n_samples * train_ratio)
+        n_val = int(n_samples * val_ratio)
+        
+        train_idx = sorted_indices[:n_train]
+        val_idx = sorted_indices[n_train : n_train + n_val]
+        test_idx = sorted_indices[n_train + n_val :]
+        
+        train_mask[train_idx] = True
+        val_mask[val_idx] = True
+        test_mask[test_idx] = True
+        
+    print(f"Temporal Split Summary: Train samples = {train_mask.sum()} ({train_mask.mean()*100:.1f}%) | "
+          f"Val samples = {val_mask.sum()} ({val_mask.mean()*100:.1f}%) | "
+          f"Test samples = {test_mask.sum()} ({test_mask.mean()*100:.1f}%)")
+          
+    return train_mask, val_mask, test_mask
+
+
+# --- 4. Custom Dataset with Feature Delta Augmentation (Delta X) ---
 class EnhancedDialysisDataset(Dataset):
-    def __init__(self, X, y, pids, allowed_pids, T, use_deltas=True):
+    def __init__(self, X, y, pids, allowed_mask, T, use_deltas=True):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
         self.T = T
         self.use_deltas = use_deltas
         
-        mask = np.isin(pids, allowed_pids)
         pids_arr = np.array(pids)
+        # Ensure all T steps in the window belong to the same patient
         same_patient = pids_arr[T - 1:] == pids_arr[:- (T - 1)]
-        target_mask = mask[T - 1:]
+        
+        # Mask for allowed target indices for this specific split
+        target_mask = allowed_mask[T - 1:]
         
         valid_flags = same_patient & target_mask
         self.valid_indices = np.where(valid_flags)[0] + (T - 1)
@@ -133,7 +167,7 @@ class EnhancedDialysisDataset(Dataset):
         return X_seq, y_target
 
 
-# --- 4. FIXED ARCHITECTURE: BiLSTM_32_1L ---
+# --- 5. FIXED ARCHITECTURE: BiLSTM_32_1L ---
 class FixedBiLSTM(nn.Module):
     def __init__(self, input_dim):
         """
@@ -205,7 +239,7 @@ def evaluate_dataset(model, data_loader, device):
     return avg_mape, avg_mae
 
 
-# --- 5. Training Loop ---
+# --- 6. Training Loop ---
 def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
     if exp_config["loss_type"] == "hybrid":
         train_criterion = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.01)
@@ -278,7 +312,7 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
     return val_mape_hist, final_val_mape, final_val_mae, final_test_mape, final_test_mae
 
 
-# --- 6. Main Execution Pipeline ---
+# --- 7. Main Execution Pipeline ---
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using execution device: {device}")
@@ -286,26 +320,12 @@ def main():
     # 1. Load Data
     X_all, y_all, pid_all, time_all = load_and_preprocess_data()
     
-    # 2. Patient-wise Split (50% train / 10% val / 40% test)
-    unique_pids = np.unique(pid_all)
-    np.random.seed(42)
-    shuffled_pids = unique_pids.copy()
-    np.random.shuffle(shuffled_pids)
+    # 2. Temporal Patient-wise Split (60% Train+Val / 40% Test)
+    train_mask, val_mask, test_mask = create_temporal_split_masks(
+        pid_all, time_all, train_ratio=0.5, val_ratio=0.1, mode=SPLIT_MODE
+    )
     
-    n_patients = len(shuffled_pids)
-    train_end = int(n_patients * 0.5)
-    val_end = int(n_patients * 0.6)
-    
-    train_pids = shuffled_pids[:train_end]
-    val_pids = shuffled_pids[train_end:val_end]
-    test_pids = shuffled_pids[val_end:]
-    
-    print(f"\nPatient-wise split summary: Total Unique Patients = {n_patients}")
-    print(f"Train: {len(train_pids)} patients | Val: {len(val_pids)} patients | Test: {len(test_pids)} patients")
-    
-    train_mask = np.isin(pid_all, train_pids)
-    
-    # Standardization
+    # Standardization computed strictly on the Training partition to prevent data leakage
     mean = X_all[train_mask].mean(axis=0, keepdims=True)
     std = X_all[train_mask].std(axis=0, keepdims=True)
     std[std == 0] = 1.0
@@ -350,9 +370,9 @@ def main():
         name = exp["name"]
         print(f"\nConfiguring Experiment: {name}...")
         
-        train_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, train_pids, T=seq_len, use_deltas=exp["use_deltas"])
-        val_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, val_pids, T=seq_len, use_deltas=exp["use_deltas"])
-        test_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, test_pids, T=seq_len, use_deltas=exp["use_deltas"])
+        train_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, train_mask, T=seq_len, use_deltas=exp["use_deltas"])
+        val_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, val_mask, T=seq_len, use_deltas=exp["use_deltas"])
+        test_dataset = EnhancedDialysisDataset(X_scaled, y_all, pid_all, test_mask, T=seq_len, use_deltas=exp["use_deltas"])
         
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
@@ -375,51 +395,50 @@ def main():
             "Test MAE (days)": round(test_mae, 2)
         })
         
-    # --- 1. GENERATE FINAL TABLE ---
+    # --- GENERATE FINAL TABLE ---
     df_results = pd.DataFrame(results)
     
     print("\n" + "="*95)
-    print(f" FINAL TEST SET PERFORMANCE EVALUATION TABLE (T = {seq_len} SESSIONS)")
+    print(f" FINAL TEST SET PERFORMANCE EVALUATION TABLE (TEMPORAL SPLIT, T = {seq_len})")
     print("="*95)
     print(df_results.to_string(index=False))
     print("="*95)
     
     # Save table to CSV
-    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_T{seq_len}.csv")
+    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_temporal_T{seq_len}.csv")
     df_results.to_csv(csv_out_path, index=False)
     print(f"\nResults table saved to CSV: {csv_out_path}")
     
-    # --- 2. PLOT 1: FINAL TEST MAPE BAR CHART ---
+    # --- PLOT 1: FINAL TEST MAPE BAR CHART ---
     plt.figure(figsize=(10, 6))
     bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAPE (%)"], color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
-    plt.title(f"Final Performance Evaluation on Test Set (T = {seq_len} Sessions)", fontsize=14, fontweight='bold')
+    plt.title(f"Final Performance Evaluation on Test Set (Temporal Split, T = {seq_len})", fontsize=14, fontweight='bold')
     plt.ylabel("Mean Absolute Percentage Error (MAPE) in %", fontsize=12)
     plt.xticks(rotation=15, ha="right", fontsize=10)
     plt.ylim(50, 90)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     
-    # Add numeric labels above each bar
     for bar in bars:
         yval = bar.get_height()
         plt.text(bar.get_x() + bar.get_width()/2.0, yval + 0.8, f"{yval:.2f}%", ha='center', va='bottom', fontweight='bold')
         
     plt.tight_layout()
-    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mape_comparison_T{seq_len}.png")
+    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mape_comparison_temporal_T{seq_len}.png")
     plt.savefig(bar_plot_path)
     print(f"Performance bar chart saved to: {bar_plot_path}")
     
-    # --- 3. PLOT 2: VALIDATION LEARNING CURVES ---
+    # --- PLOT 2: VALIDATION LEARNING CURVES ---
     plt.figure(figsize=(12, 7))
     for name, hist in val_histories.items():
         plt.plot(range(1, len(hist) + 1), hist, label=f"{name}")
         
-    plt.title(f"Validation Curves per Epoch (Validation MAPE %) - T = {seq_len} Sessions", fontsize=14)
+    plt.title(f"Validation Curves per Epoch (Temporal Split, T = {seq_len})", fontsize=14)
     plt.xlabel("Epoch", fontsize=12)
     plt.ylabel("Validation MAPE (%)", fontsize=12)
     plt.legend()
     plt.grid(True, ls="--")
     plt.tight_layout()
-    curve_plot_path = os.path.join(CACHE_DIR, f"val_mape_learning_curves_T{seq_len}.png")
+    curve_plot_path = os.path.join(CACHE_DIR, f"val_mape_learning_curves_temporal_T{seq_len}.png")
     plt.savefig(curve_plot_path)
     print(f"Validation learning curves plot saved to: {curve_plot_path}")
 
