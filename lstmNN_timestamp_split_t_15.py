@@ -8,7 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
 # --- Configurations ---
-DEFAULT_CSV = r"c:\Users\vince\Desktop\NN\Datasets\NN_training_dataset_44misure_cap400.csv"
+DEFAULT_CSV = r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
 CSV_PATH = DEFAULT_CSV if os.path.exists(DEFAULT_CSV) else r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
 CACHE_DIR = r"c:\Users\vince\Desktop\NN"
 
