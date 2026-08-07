@@ -409,22 +409,26 @@ def main():
     df_results.to_csv(csv_out_path, index=False)
     print(f"\nResults table saved to CSV: {csv_out_path}")
     
-    # --- PLOT 1: FINAL TEST MAPE BAR CHART ---
-    plt.figure(figsize=(10, 6))
+    # --- PLOT 1: FINAL TEST MAPE BAR CHART (UPDATED) ---
+    plt.figure(figsize=(12, 7))
     bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAPE (%)"], color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
     plt.title(f"Final Performance Evaluation on Test Set (Temporal Split, T = {seq_len})", fontsize=14, fontweight='bold')
     plt.ylabel("Mean Absolute Percentage Error (MAPE) in %", fontsize=12)
     plt.xticks(rotation=15, ha="right", fontsize=10)
-    plt.ylim(50, 90)
+    
+    # Dynamic Y-axis scale to fit high MAPE values correctly
+    max_mape = df_results["Test MAPE (%)"].max()
+    plt.ylim(0, max_mape * 1.15)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     
+    # Add labels on top of each bar
     for bar in bars:
         yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2.0, yval + 0.8, f"{yval:.2f}%", ha='center', va='bottom', fontweight='bold')
+        plt.text(bar.get_x() + bar.get_width()/2.0, yval + (max_mape * 0.02), f"{yval:.2f}%", ha='center', va='bottom', fontweight='bold')
         
-    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.25, top=0.90)  # Fixes the tight layout UserWarning
     bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mape_comparison_temporal_T{seq_len}.png")
-    plt.savefig(bar_plot_path)
+    plt.savefig(bar_plot_path, bbox_inches='tight')
     print(f"Performance bar chart saved to: {bar_plot_path}")
     
     # --- PLOT 2: VALIDATION LEARNING CURVES ---
