@@ -17,10 +17,9 @@ BATCH_SIZE = 128
 LEARNING_RATE = 5e-5
 
 # Split Configuration: "per_patient_temporal" (60% past / 40% future per patient)
-# or "global_temporal" (60% earliest global dates / 40% latest global dates)
 SPLIT_MODE = "per_patient_temporal" 
 
-# --- 1. Custom Loss Functions ---
+# --- 1. Custom Metrics & Loss Functions ---
 class MAPELoss(nn.Module):
     def __init__(self, min_val=10.0):
         super().__init__()
@@ -30,23 +29,6 @@ class MAPELoss(nn.Module):
         denom = torch.clamp(targets, min=self.min_val)
         absolute_percentage_errors = torch.abs(outputs - targets) / denom
         return torch.mean(absolute_percentage_errors) * 100.0
-
-
-class HybridMAPEMAELoss(nn.Module):
-    def __init__(self, min_val=10.0, mae_weight=0.01):
-        """
-        Hybrid Loss: Calculates MAPE with denominator clamping and adds a
-        weighted penalty on mean absolute error (MAE) in days.
-        """
-        super().__init__()
-        self.min_val = min_val
-        self.mae_weight = mae_weight
-
-    def forward(self, outputs, targets):
-        denom = torch.clamp(targets, min=self.min_val)
-        mape = torch.mean(torch.abs(outputs - targets) / denom) * 100.0
-        mae = torch.mean(torch.abs(outputs - targets))
-        return mape + (self.mae_weight * mae)
 
 
 # --- 2. Data Preparation ---
@@ -83,10 +65,6 @@ def load_and_preprocess_data():
 
 # --- 3. Temporal Patient-wise Dataset Split Function ---
 def create_temporal_split_masks(pid_all, time_all, train_ratio=0.5, val_ratio=0.1, mode="per_patient_temporal"):
-    """
-    Creates boolean masks for Train (50%), Validation (10%), and Test (40%) splits
-    respecting chronological timestamp ordering.
-    """
     n_samples = len(pid_all)
     train_mask = np.zeros(n_samples, dtype=bool)
     val_mask = np.zeros(n_samples, dtype=bool)
@@ -111,24 +89,9 @@ def create_temporal_split_masks(pid_all, time_all, train_ratio=0.5, val_ratio=0.
             val_mask[val_idx_p] = True
             test_mask[test_idx_p] = True
 
-    elif mode == "global_temporal":
-        print("Executing Global Timestamp Cutoff Split (60% earliest overall / 40% latest overall)...")
-        sorted_indices = np.argsort(time_all)
-        
-        n_train = int(n_samples * train_ratio)
-        n_val = int(n_samples * val_ratio)
-        
-        train_idx = sorted_indices[:n_train]
-        val_idx = sorted_indices[n_train : n_train + n_val]
-        test_idx = sorted_indices[n_train + n_val :]
-        
-        train_mask[train_idx] = True
-        val_mask[val_idx] = True
-        test_mask[test_idx] = True
-        
-    print(f"Temporal Split Summary: Train samples = {train_mask.sum()} ({train_mask.mean()*100:.1f}%) | "
-          f"Val samples = {val_mask.sum()} ({val_mask.mean()*100:.1f}%) | "
-          f"Test samples = {test_mask.sum()} ({test_mask.mean()*100:.1f}%)")
+    print(f"Temporal Split Summary: Train = {train_mask.sum()} samples ({train_mask.mean()*100:.1f}%) | "
+          f"Val = {val_mask.sum()} samples ({val_mask.mean()*100:.1f}%) | "
+          f"Test = {test_mask.sum()} samples ({test_mask.mean()*100:.1f}%)")
           
     return train_mask, val_mask, test_mask
 
@@ -142,10 +105,7 @@ class EnhancedDialysisDataset(Dataset):
         self.use_deltas = use_deltas
         
         pids_arr = np.array(pids)
-        # Ensure all T steps in the window belong to the same patient
         same_patient = pids_arr[T - 1:] == pids_arr[:- (T - 1)]
-        
-        # Mask for allowed target indices for this specific split
         target_mask = allowed_mask[T - 1:]
         
         valid_flags = same_patient & target_mask
@@ -167,19 +127,18 @@ class EnhancedDialysisDataset(Dataset):
         return X_seq, y_target
 
 
-# --- 5. FIXED ARCHITECTURE: BiLSTM_32_1L ---
-class FixedBiLSTM(nn.Module):
-    def __init__(self, input_dim):
-        """
-        BiLSTM Architecture with 32 units per direction (64 total) with LayerNorm.
-        """
+# --- 5. COMPACT ARCHITECTURE: CompactBiLSTM ---
+class CompactBiLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_size=16, dropout_rate=0.2):
         super().__init__()
-        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=32, num_layers=1, batch_first=True, bidirectional=True)
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_size, num_layers=1, batch_first=True, bidirectional=True)
+        concat_dim = hidden_size * 2
         self.head = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.LayerNorm(32),
+            nn.Linear(concat_dim, 16),
+            nn.LayerNorm(16),
             nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Dropout(dropout_rate),
+            nn.Linear(16, 1)
         )
 
     def forward(self, x):
@@ -188,33 +147,29 @@ class FixedBiLSTM(nn.Module):
         return self.head(last_step)
 
 
-# --- Early Stopping Helper ---
-class EarlyStopping:
+# --- Early Stopping Helper (Monitoring MAE in Days) ---
+class EarlyStoppingMAE:
     def __init__(self, patience=30, min_delta=0.0):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
-        self.best_loss = None
+        self.best_mae = None
         self.early_stop = False
 
-    def __call__(self, val_loss):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
+    def __call__(self, val_mae):
+        if self.best_mae is None:
+            self.best_mae = val_mae
+        elif val_mae > self.best_mae - self.min_delta:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
-            self.best_loss = val_loss
+            self.best_mae = val_mae
             self.counter = 0
 
 
 # --- Evaluation Function ---
 def evaluate_dataset(model, data_loader, device):
-    """
-    Performs formal evaluation on a DataLoader (Validation or Test Set).
-    Returns MAPE (%) and MAE (days).
-    """
     model.eval()
     mape_criterion = MAPELoss(min_val=10.0)
     total_mape = 0.0
@@ -239,12 +194,10 @@ def evaluate_dataset(model, data_loader, device):
     return avg_mape, avg_mae
 
 
-# --- 6. Training Loop ---
-def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
-    if exp_config["loss_type"] == "hybrid":
-        train_criterion = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.01)
-    else:
-        train_criterion = HybridMAPEMAELoss(min_val=10.0, mae_weight=0.0)
+# --- 6. Training Loop (Optimizing Pure MAE Loss) ---
+def train_and_evaluate_bilstm_mae(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
+    # OPTION A: Pure MAE Loss (L1 Loss in days)
+    train_criterion = nn.L1Loss()
         
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     
@@ -253,12 +206,12 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     
-    train_losses, val_mape_hist = [], []
-    best_val_loss = float('inf')
-    early_stopping = EarlyStopping(patience=30)
-    weights_path = f"best_weights_{exp_name}.pth"
+    val_mae_hist = []
+    best_val_mae = float('inf')
+    early_stopping = EarlyStoppingMAE(patience=30)
+    weights_path = f"best_weights_mae_{exp_name}.pth"
     
-    print(f"\n--- Training {exp_name} on {device} ---")
+    print(f"\n--- Training Compact {exp_name} with Pure MAE Loss on {device} ---")
     
     for epoch in range(EPOCHS):
         model.train()
@@ -279,37 +232,41 @@ def train_and_evaluate_bilstm(model, train_loader, val_loader, test_loader, exp_
             
         scheduler.step()
         epoch_train_loss /= len(train_loader.dataset)
-        train_losses.append(epoch_train_loss)
         
-        # Validation at epoch end
+        # Validation evaluation at epoch end
         val_mape, val_mae = evaluate_dataset(model, val_loader, device)
-        val_mape_hist.append(val_mape)
+        val_mae_hist.append(val_mae)
         
-        # Checkpointing based on Validation Loss
-        if val_mape < best_val_loss:
-            best_val_loss = val_mape
+        # Checkpointing based on Validation MAE (in days)
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
             torch.save(model.state_dict(), weights_path)
             
         current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | LR: {current_lr:.1e} | Train Loss: {epoch_train_loss:.2f} | "
-              f"Val MAPE: {val_mape:.2f}% (Best Val: {best_val_loss:.2f}%)")
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            train_mape, train_mae = evaluate_dataset(model, train_loader, device)
+            print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | LR: {current_lr:.1e} | "
+                  f"Train MAE: {train_mae:.2f}d | Val MAE: {val_mae:.2f}d (Best Val: {best_val_mae:.2f}d)")
         
-        early_stopping(val_mape)
+        early_stopping(val_mae)
         if early_stopping.early_stop:
             print(f"Early stopping triggered at epoch {epoch+1}.")
             break
             
-    # --- FORMAL EVALUATION ON FINAL TEST SET ---
-    print(f"\n[EVALUATION] Loading optimal weights from '{weights_path}' for evaluation on Test Set...")
+    # --- FORMAL EVALUATION ON TRAIN, VAL AND TEST SET ---
+    print(f"\n[EVALUATION] Loading optimal weights from '{weights_path}' for evaluation...")
     if os.path.exists(weights_path):
         model.load_state_dict(torch.load(weights_path))
         
-    final_test_mape, final_test_mae = evaluate_dataset(model, test_loader, device)
+    final_train_mape, final_train_mae = evaluate_dataset(model, train_loader, device)
     final_val_mape, final_val_mae = evaluate_dataset(model, val_loader, device)
+    final_test_mape, final_test_mae = evaluate_dataset(model, test_loader, device)
     
-    print(f"--> [FORMAL TEST SET RESULT] {exp_name} | MAPE: {final_test_mape:.2f}% | MAE: {final_test_mae:.2f} days")
+    print(f"--> [FINAL OPTION A RESULT] {exp_name} | "
+          f"Train MAE: {final_train_mae:.2f}d | Val MAE: {final_val_mae:.2f}d | Test MAE: {final_test_mae:.2f}d | "
+          f"Test MAPE: {final_test_mape:.2f}%")
     
-    return val_mape_hist, final_val_mape, final_val_mae, final_test_mape, final_test_mae
+    return val_mae_hist, final_train_mape, final_train_mae, final_val_mape, final_val_mae, final_test_mape, final_test_mae
 
 
 # --- 7. Main Execution Pipeline ---
@@ -325,7 +282,7 @@ def main():
         pid_all, time_all, train_ratio=0.5, val_ratio=0.1, mode=SPLIT_MODE
     )
     
-    # Standardization computed strictly on the Training partition to prevent data leakage
+    # Standardization computed strictly on the Training partition
     mean = X_all[train_mask].mean(axis=0, keepdims=True)
     std = X_all[train_mask].std(axis=0, keepdims=True)
     std[std == 0] = 1.0
@@ -334,30 +291,26 @@ def main():
     seq_len = 15
     print(f"Sliding window length configured to T = {seq_len} sessions.")
     
-    # 3. Define the 4 Pipeline Experiments
+    # 3. Define Experiments (Evaluating Pure MAE Training)
     experiments = [
         {
-            "name": "BiLSTM_32_1L_Winner_Baseline",
+            "name": "BiLSTM_16_1L_MAE_Baseline",
             "use_deltas": False,
-            "loss_type": "pure_mape",
             "scheduler": "cosine"
         },
         {
-            "name": "BiLSTM_32_1L_FeatureDeltas",
+            "name": "BiLSTM_16_1L_MAE_FeatureDeltas",
             "use_deltas": True,
-            "loss_type": "pure_mape",
             "scheduler": "cosine"
         },
         {
-            "name": "BiLSTM_32_1L_WarmRestarts",
+            "name": "BiLSTM_16_1L_MAE_WarmRestarts",
             "use_deltas": False,
-            "loss_type": "pure_mape",
             "scheduler": "warm_restarts"
         },
         {
-            "name": "BiLSTM_32_1L_Deltas_HybridLoss",
+            "name": "BiLSTM_16_1L_MAE_Deltas_WarmRestarts",
             "use_deltas": True,
-            "loss_type": "hybrid",
             "scheduler": "warm_restarts"
         }
     ]
@@ -379,69 +332,71 @@ def main():
         
         num_features = X_scaled.shape[1]
         input_dim = num_features * 2 if exp["use_deltas"] else num_features
-        model = FixedBiLSTM(input_dim=input_dim).to(device)
         
-        val_mape_hist, val_mape, val_mae, test_mape, test_mae = train_and_evaluate_bilstm(
+        # Instantiate Reduced Compact Architecture
+        model = CompactBiLSTM(input_dim=input_dim, hidden_size=16, dropout_rate=0.2).to(device)
+        
+        val_mae_hist, train_mape, train_mae, val_mape, val_mae, test_mape, test_mae = train_and_evaluate_bilstm_mae(
             model, train_loader, val_loader, test_loader, exp, name, device
         )
         
-        val_histories[name] = val_mape_hist
+        val_histories[name] = val_mae_hist
         results.append({
             "Architecture / Pipeline": name,
-            "Val MAPE (%)": round(val_mape, 2),
+            "Train MAE (days)": round(train_mae, 2),
             "Val MAE (days)": round(val_mae, 2),
-            "Test MAPE (%)": round(test_mape, 2),
-            "Test MAE (days)": round(test_mae, 2)
+            "Test MAE (days)": round(test_mae, 2),
+            "Train MAPE (%)": round(train_mape, 2),
+            "Val MAPE (%)": round(val_mape, 2),
+            "Test MAPE (%)": round(test_mape, 2)
         })
         
     # --- GENERATE FINAL TABLE ---
     df_results = pd.DataFrame(results)
     
-    print("\n" + "="*95)
-    print(f" FINAL TEST SET PERFORMANCE EVALUATION TABLE (TEMPORAL SPLIT, T = {seq_len})")
-    print("="*95)
+    print("\n" + "="*110)
+    print(f" FINAL TEST SET PERFORMANCE EVALUATION TABLE (OPTION A - PURE MAE LOSS, T = {seq_len})")
+    print("="*110)
     print(df_results.to_string(index=False))
-    print("="*95)
+    print("="*110)
     
     # Save table to CSV
-    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_temporal_T{seq_len}.csv")
+    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_optionA_MAE_T{seq_len}.csv")
     df_results.to_csv(csv_out_path, index=False)
     print(f"\nResults table saved to CSV: {csv_out_path}")
     
-    # --- PLOT 1: FINAL TEST MAPE BAR CHART (UPDATED) ---
+    # --- PLOT 1: FINAL TEST MAE BAR CHART (IN DAYS) ---
     plt.figure(figsize=(12, 7))
-    bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAPE (%)"], color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
-    plt.title(f"Final Performance Evaluation on Test Set (Temporal Split, T = {seq_len})", fontsize=14, fontweight='bold')
-    plt.ylabel("Mean Absolute Percentage Error (MAPE) in %", fontsize=12)
+    bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAE (days)"], color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
+    plt.title(f"Final Test MAE Evaluation in Days (Option A - Pure MAE Loss, T = {seq_len})", fontsize=14, fontweight='bold')
+    plt.ylabel("Mean Absolute Error (MAE) in Days", fontsize=12)
     plt.xticks(rotation=15, ha="right", fontsize=10)
     
-    # Dynamic Y-axis scale to fit high MAPE values correctly
-    max_mape = df_results["Test MAPE (%)"].max()
-    plt.ylim(0, max_mape * 1.15)
+    max_mae = df_results["Test MAE (days)"].max()
+    plt.ylim(0, max_mae * 1.15)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     
-    # Add labels on top of each bar
     for bar in bars:
         yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2.0, yval + (max_mape * 0.02), f"{yval:.2f}%", ha='center', va='bottom', fontweight='bold')
+        plt.text(bar.get_x() + bar.get_width()/2.0, yval + (max_mae * 0.02), f"{yval:.2f}d", ha='center', va='bottom', fontweight='bold')
         
-    plt.subplots_adjust(bottom=0.25, top=0.90)  # Fixes the tight layout UserWarning
-    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mape_comparison_temporal_T{seq_len}.png")
+    plt.subplots_adjust(bottom=0.25, top=0.90)
+    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mae_optionA_T{seq_len}.png")
     plt.savefig(bar_plot_path, bbox_inches='tight')
     print(f"Performance bar chart saved to: {bar_plot_path}")
     
-    # --- PLOT 2: VALIDATION LEARNING CURVES ---
+    # --- PLOT 2: VALIDATION LEARNING CURVES (MAE IN DAYS) ---
     plt.figure(figsize=(12, 7))
     for name, hist in val_histories.items():
         plt.plot(range(1, len(hist) + 1), hist, label=f"{name}")
         
-    plt.title(f"Validation Curves per Epoch (Temporal Split, T = {seq_len})", fontsize=14)
+    plt.title(f"Validation MAE Curves per Epoch in Days (Option A, T = {seq_len})", fontsize=14)
     plt.xlabel("Epoch", fontsize=12)
-    plt.ylabel("Validation MAPE (%)", fontsize=12)
+    plt.ylabel("Validation MAE (Days)", fontsize=12)
     plt.legend()
     plt.grid(True, ls="--")
     plt.tight_layout()
-    curve_plot_path = os.path.join(CACHE_DIR, f"val_mape_learning_curves_temporal_T{seq_len}.png")
+    curve_plot_path = os.path.join(CACHE_DIR, f"val_mae_learning_curves_optionA_T{seq_len}.png")
     plt.savefig(curve_plot_path)
     print(f"Validation learning curves plot saved to: {curve_plot_path}")
 
