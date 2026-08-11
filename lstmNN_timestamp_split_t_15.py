@@ -12,14 +12,16 @@ DEFAULT_CSV = r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
 CSV_PATH = DEFAULT_CSV if os.path.exists(DEFAULT_CSV) else r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
 CACHE_DIR = r"c:\Users\vince\Desktop\NN"
 
-EPOCHS = 500
+EPOCHS = 300
 BATCH_SIZE = 128
-LEARNING_RATE = 5e-5
+LEARNING_RATE = 2e-4
+WEIGHT_DECAY = 1e-2  # Regolarizzazione L2 aggressiva
 
 # Split Configuration: "per_patient_temporal" (60% past / 40% future per patient)
 SPLIT_MODE = "per_patient_temporal" 
 
-# --- 1. Custom Metrics & Loss Functions ---
+
+# --- 1. Custom Loss & Metrics ---
 class MAPELoss(nn.Module):
     def __init__(self, min_val=10.0):
         super().__init__()
@@ -96,7 +98,7 @@ def create_temporal_split_masks(pid_all, time_all, train_ratio=0.5, val_ratio=0.
     return train_mask, val_mask, test_mask
 
 
-# --- 4. Custom Dataset with Feature Delta Augmentation (Delta X) ---
+# --- 4. Custom Dataset with Strict Sequence Boundaries ---
 class EnhancedDialysisDataset(Dataset):
     def __init__(self, X, y, pids, allowed_mask, T, use_deltas=True):
         self.X = torch.tensor(X, dtype=torch.float32)
@@ -105,10 +107,14 @@ class EnhancedDialysisDataset(Dataset):
         self.use_deltas = use_deltas
         
         pids_arr = np.array(pids)
-        same_patient = pids_arr[T - 1:] == pids_arr[:- (T - 1)]
-        target_mask = allowed_mask[T - 1:]
         
-        valid_flags = same_patient & target_mask
+        # 1. Stesso paziente lungo la finestra T
+        same_patient = (pids_arr[T - 1:] == pids_arr[: len(pids_arr) - T + 1])
+        
+        # 2. Tutti i T passi della sequenza devono ricadere nello stesso sottoinsieme (no data leakage)
+        window_allowed = np.convolve(allowed_mask.astype(int), np.ones(T, dtype=int), mode='valid') == T
+        
+        valid_flags = same_patient & window_allowed
         self.valid_indices = np.where(valid_flags)[0] + (T - 1)
         
     def __len__(self):
@@ -116,7 +122,7 @@ class EnhancedDialysisDataset(Dataset):
 
     def __getitem__(self, idx):
         target_idx = self.valid_indices[idx]
-        X_seq = self.X[target_idx - self.T + 1 : target_idx + 1]
+        X_seq = self.X[target_idx - self.T + 1 : target_idx + 1].clone()
         
         if self.use_deltas:
             deltas = torch.zeros_like(X_seq)
@@ -127,14 +133,25 @@ class EnhancedDialysisDataset(Dataset):
         return X_seq, y_target
 
 
-# --- 5. COMPACT ARCHITECTURE: CompactBiLSTM ---
-class CompactBiLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_size=16, dropout_rate=0.2):
+# --- 5. ANTI-OVERFITTING ARCHITECTURE: MicroLSTM ---
+class MicroLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_size=8, dropout_rate=0.35, noise_std=0.03):
+        """
+        Ultra-compact Unidirectional MicroLSTM (8 hidden units)
+        with Input Noise Injection and Heavy Dropout to strictly prevent overfitting.
+        """
         super().__init__()
-        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_size, num_layers=1, batch_first=True, bidirectional=True)
-        concat_dim = hidden_size * 2
+        self.noise_std = noise_std
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=False
+        )
         self.head = nn.Sequential(
-            nn.Linear(concat_dim, 16),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_size, 16),
             nn.LayerNorm(16),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
@@ -142,12 +159,16 @@ class CompactBiLSTM(nn.Module):
         )
 
     def forward(self, x):
+        # Iniezione di rumore gaussiano durante il training per evitare la memorizzazione
+        if self.training and self.noise_std > 0:
+            x = x + torch.randn_like(x) * self.noise_std
+
         lstm_out, _ = self.lstm(x)
         last_step = lstm_out[:, -1, :]
         return self.head(last_step)
 
 
-# --- Early Stopping Helper (Monitoring MAE in Days) ---
+# --- Early Stopping Helper ---
 class EarlyStoppingMAE:
     def __init__(self, patience=30, min_delta=0.0):
         self.patience = patience
@@ -194,28 +215,25 @@ def evaluate_dataset(model, data_loader, device):
     return avg_mape, avg_mae
 
 
-# --- 6. Training Loop (Optimizing Pure MAE Loss) ---
-def train_and_evaluate_bilstm_mae(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
-    # OPTION A: Pure MAE Loss (L1 Loss in days)
-    train_criterion = nn.L1Loss()
+# --- 6. Training Loop ---
+def train_and_evaluate_model(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
+    # Loss Huber (Smooth L1) per stabilità anti-overfitting
+    train_criterion = nn.SmoothL1Loss(beta=5.0)
         
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
-    
-    if exp_config["scheduler"] == "warm_restarts":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=1)
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     
     val_mae_hist = []
     best_val_mae = float('inf')
     early_stopping = EarlyStoppingMAE(patience=30)
-    weights_path = f"best_weights_mae_{exp_name}.pth"
+    weights_path = os.path.join(CACHE_DIR, f"best_weights_{exp_name}.pth")
     
-    print(f"\n--- Training Compact {exp_name} with Pure MAE Loss on {device} ---")
+    print(f"\n--- Training MicroLSTM {exp_name} on {device} ---")
     
     for epoch in range(EPOCHS):
         model.train()
         epoch_train_loss = 0.0
+        
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             
@@ -237,7 +255,6 @@ def train_and_evaluate_bilstm_mae(model, train_loader, val_loader, test_loader, 
         val_mape, val_mae = evaluate_dataset(model, val_loader, device)
         val_mae_hist.append(val_mae)
         
-        # Checkpointing based on Validation MAE (in days)
         if val_mae < best_val_mae:
             best_val_mae = val_mae
             torch.save(model.state_dict(), weights_path)
@@ -253,8 +270,8 @@ def train_and_evaluate_bilstm_mae(model, train_loader, val_loader, test_loader, 
             print(f"Early stopping triggered at epoch {epoch+1}.")
             break
             
-    # --- FORMAL EVALUATION ON TRAIN, VAL AND TEST SET ---
-    print(f"\n[EVALUATION] Loading optimal weights from '{weights_path}' for evaluation...")
+    # --- FORMAL EVALUATION ---
+    print(f"\n[EVALUATION] Loading optimal weights from '{weights_path}'...")
     if os.path.exists(weights_path):
         model.load_state_dict(torch.load(weights_path))
         
@@ -262,7 +279,7 @@ def train_and_evaluate_bilstm_mae(model, train_loader, val_loader, test_loader, 
     final_val_mape, final_val_mae = evaluate_dataset(model, val_loader, device)
     final_test_mape, final_test_mae = evaluate_dataset(model, test_loader, device)
     
-    print(f"--> [FINAL OPTION A RESULT] {exp_name} | "
+    print(f"--> [MICRO RESULT] {exp_name} | "
           f"Train MAE: {final_train_mae:.2f}d | Val MAE: {final_val_mae:.2f}d | Test MAE: {final_test_mae:.2f}d | "
           f"Test MAPE: {final_test_mape:.2f}%")
     
@@ -272,17 +289,17 @@ def train_and_evaluate_bilstm_mae(model, train_loader, val_loader, test_loader, 
 # --- 7. Main Execution Pipeline ---
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using execution device: {device}")
+    print(f"Execution device: {device}")
     
     # 1. Load Data
     X_all, y_all, pid_all, time_all = load_and_preprocess_data()
     
-    # 2. Temporal Patient-wise Split (60% Train+Val / 40% Test)
+    # 2. Temporal Patient-wise Split
     train_mask, val_mask, test_mask = create_temporal_split_masks(
         pid_all, time_all, train_ratio=0.5, val_ratio=0.1, mode=SPLIT_MODE
     )
     
-    # Standardization computed strictly on the Training partition
+    # Standardization computed strictly on Training partition
     mean = X_all[train_mask].mean(axis=0, keepdims=True)
     std = X_all[train_mask].std(axis=0, keepdims=True)
     std[std == 0] = 1.0
@@ -291,27 +308,25 @@ def main():
     seq_len = 15
     print(f"Sliding window length configured to T = {seq_len} sessions.")
     
-    # 3. Define Experiments (Evaluating Pure MAE Training)
+    # 3. Define Micro Experiments
     experiments = [
         {
-            "name": "BiLSTM_16_1L_MAE_Baseline",
+            "name": "MicroLSTM_Baseline",
             "use_deltas": False,
-            "scheduler": "cosine"
+            "hidden_size": 8,
+            "dropout": 0.35
         },
         {
-            "name": "BiLSTM_16_1L_MAE_FeatureDeltas",
+            "name": "MicroLSTM_WithDeltas",
             "use_deltas": True,
-            "scheduler": "cosine"
+            "hidden_size": 8,
+            "dropout": 0.35
         },
         {
-            "name": "BiLSTM_16_1L_MAE_WarmRestarts",
-            "use_deltas": False,
-            "scheduler": "warm_restarts"
-        },
-        {
-            "name": "BiLSTM_16_1L_MAE_Deltas_WarmRestarts",
+            "name": "MicroLSTM_UltraCompact",
             "use_deltas": True,
-            "scheduler": "warm_restarts"
+            "hidden_size": 6,
+            "dropout": 0.40
         }
     ]
     
@@ -333,10 +348,15 @@ def main():
         num_features = X_scaled.shape[1]
         input_dim = num_features * 2 if exp["use_deltas"] else num_features
         
-        # Instantiate Reduced Compact Architecture
-        model = CompactBiLSTM(input_dim=input_dim, hidden_size=16, dropout_rate=0.2).to(device)
+        # Instantiate Micro Architecture
+        model = MicroLSTM(
+            input_dim=input_dim,
+            hidden_size=exp["hidden_size"],
+            dropout_rate=exp["dropout"],
+            noise_std=0.03
+        ).to(device)
         
-        val_mae_hist, train_mape, train_mae, val_mape, val_mae, test_mape, test_mae = train_and_evaluate_bilstm_mae(
+        val_mae_hist, train_mape, train_mae, val_mape, val_mae, test_mape, test_mae = train_and_evaluate_model(
             model, train_loader, val_loader, test_loader, exp, name, device
         )
         
@@ -355,22 +375,22 @@ def main():
     df_results = pd.DataFrame(results)
     
     print("\n" + "="*110)
-    print(f" FINAL TEST SET PERFORMANCE EVALUATION TABLE (OPTION A - PURE MAE LOSS, T = {seq_len})")
+    print(f" FINAL PERFORMANCE EVALUATION TABLE (MICRO MODEL, T = {seq_len})")
     print("="*110)
     print(df_results.to_string(index=False))
     print("="*110)
     
     # Save table to CSV
-    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_optionA_MAE_T{seq_len}.csv")
+    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_micro_T{seq_len}.csv")
     df_results.to_csv(csv_out_path, index=False)
     print(f"\nResults table saved to CSV: {csv_out_path}")
     
-    # --- PLOT 1: FINAL TEST MAE BAR CHART (IN DAYS) ---
-    plt.figure(figsize=(12, 7))
-    bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAE (days)"], color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
-    plt.title(f"Final Test MAE Evaluation in Days (Option A - Pure MAE Loss, T = {seq_len})", fontsize=14, fontweight='bold')
-    plt.ylabel("Mean Absolute Error (MAE) in Days", fontsize=12)
-    plt.xticks(rotation=15, ha="right", fontsize=10)
+    # --- PLOT 1: FINAL TEST MAE BAR CHART ---
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAE (days)"], color=['#2b5c8f', '#d95f02', '#7570b3'])
+    plt.title(f"Final Test MAE Evaluation in Days (MicroLSTM, T = {seq_len})", fontsize=13, fontweight='bold')
+    plt.ylabel("Mean Absolute Error (MAE) in Days", fontsize=11)
+    plt.xticks(rotation=10, ha="right")
     
     max_mae = df_results["Test MAE (days)"].max()
     plt.ylim(0, max_mae * 1.15)
@@ -381,22 +401,22 @@ def main():
         plt.text(bar.get_x() + bar.get_width()/2.0, yval + (max_mae * 0.02), f"{yval:.2f}d", ha='center', va='bottom', fontweight='bold')
         
     plt.subplots_adjust(bottom=0.25, top=0.90)
-    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mae_optionA_T{seq_len}.png")
+    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mae_micro_T{seq_len}.png")
     plt.savefig(bar_plot_path, bbox_inches='tight')
     print(f"Performance bar chart saved to: {bar_plot_path}")
     
-    # --- PLOT 2: VALIDATION LEARNING CURVES (MAE IN DAYS) ---
-    plt.figure(figsize=(12, 7))
+    # --- PLOT 2: VALIDATION LEARNING CURVES ---
+    plt.figure(figsize=(10, 6))
     for name, hist in val_histories.items():
         plt.plot(range(1, len(hist) + 1), hist, label=f"{name}")
         
-    plt.title(f"Validation MAE Curves per Epoch in Days (Option A, T = {seq_len})", fontsize=14)
-    plt.xlabel("Epoch", fontsize=12)
-    plt.ylabel("Validation MAE (Days)", fontsize=12)
+    plt.title(f"Validation MAE Curves per Epoch in Days (MicroLSTM, T = {seq_len})", fontsize=13)
+    plt.xlabel("Epoch", fontsize=11)
+    plt.ylabel("Validation MAE (Days)", fontsize=11)
     plt.legend()
     plt.grid(True, ls="--")
     plt.tight_layout()
-    curve_plot_path = os.path.join(CACHE_DIR, f"val_mae_learning_curves_optionA_T{seq_len}.png")
+    curve_plot_path = os.path.join(CACHE_DIR, f"val_mae_learning_curves_micro_T{seq_len}.png")
     plt.savefig(curve_plot_path)
     print(f"Validation learning curves plot saved to: {curve_plot_path}")
 
