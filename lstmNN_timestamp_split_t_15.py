@@ -15,10 +15,10 @@ CACHE_DIR = r"c:\Users\vince\Desktop\NN"
 EPOCHS = 350
 BATCH_SIZE = 128
 LEARNING_RATE = 3e-4
-WEIGHT_DECAY = 1e-2 # Heavy L2 regularization to prevent overfitting on tabular features
+WEIGHT_DECAY = 1e-2 # Regolarizzazione L2 per evitare overfitting
 
-# Multi-Window configuration suggested by the professor (Step 2)
-WINDOWS = [30, 60, 90]
+# Single Window size set to W = 60 as requested by the professor
+WINDOW_SIZE = 60 
 SPLIT_MODE = "per_patient_temporal"
 
 # --- 1. Custom Metrics & Loss ---
@@ -98,60 +98,52 @@ def create_temporal_split_masks(pid_all, time_all, train_ratio=0.5, val_ratio=0.
     return train_mask, val_mask, test_mask
 
 
-# --- 4. Multi-Window Linear Regression Feature Extractor (W=30, 60, 90) ---
-def extract_multi_window_trend_features(X_all, y_all, pid_all, allowed_mask, windows=[30, 60, 90]):
+# --- 4. Linear Regression Feature Extractor for W = 60 ---
+def extract_linear_regression_features(X_all, y_all, pid_all, target_mask, W=60):
     """
-    Extracts multi-window linear regression features:
-    For each W in windows: computes a_W, b_W, c_W (3 * M features).
-    Appends current value z_curr (M features).
-    Total features = (3 * len(windows) + 1) * M features per sample.
+    Extracts linear regression trend features (a, b, c) and current value z_curr for W=60.
+    Ensures targets in target_mask have at least W preceding past sessions of the same patient.
     """
-    max_W = max(windows)
-    print(f"Extracting Multi-Window Linear Regression Features {windows} (max W={max_W})...")
+    N = len(pid_all)
+    M = X_all.shape[1]
+    pids_arr = np.array(pid_all)
+    
+    print(f"Extracting Linear Regression Trend Features (a, b, c, z_curr) for W = {W}...")
     t0 = time.time()
     
-    pids_arr = np.array(pid_all)
-    M = X_all.shape[1]
+    # Target index must be in target_mask AND have W preceding sessions of the same patient
+    same_patient = (pids_arr[W - 1:] == pids_arr[: N - W + 1])
+    target_in_set = target_mask[W - 1:]
     
-    # 1. Valid window indices: same patient & max_W steps strictly inside allowed_mask
-    same_patient = (pids_arr[max_W - 1:] == pids_arr[: len(pids_arr) - max_W + 1])
-    window_allowed = np.convolve(allowed_mask.astype(int), np.ones(max_W, dtype=int), mode='valid') == max_W
-    valid_flags = same_patient & window_allowed
-    valid_indices = np.where(valid_flags)[0] + (max_W - 1)
+    valid_flags = same_patient & target_in_set
+    valid_indices = np.where(valid_flags)[0] + (W - 1)
     
     N_valid = len(valid_indices)
-    print(f"Extracted {N_valid} valid multi-window samples in {time.time() - t0:.2f}s.")
+    print(f"Extracted {N_valid} valid targets for W={W} in {time.time() - t0:.2f}s.")
     
     if N_valid == 0:
-        total_dim = (3 * len(windows) + 1) * M
-        return np.empty((0, total_dim), dtype=np.float32), np.empty((0, 1), dtype=np.float32)
+        return np.empty((0, 4 * M), dtype=np.float32), np.empty((0, 1), dtype=np.float32)
 
-    features_list = []
+    t = np.arange(W, dtype=np.float32)
+    t_mean = (W - 1) / 2.0
+    t_dev = t - t_mean
+    sum_t_dev_sq = np.sum(t_dev**2)
     
-    for W in windows:
-        t = np.arange(W, dtype=np.float32)
-        t_mean = (W - 1) / 2.0
-        t_dev = t - t_mean
-        sum_t_dev_sq = np.sum(t_dev**2)
+    windows = np.zeros((N_valid, W, M), dtype=np.float32)
+    for idx_out, target_idx in enumerate(valid_indices):
+        windows[idx_out] = X_all[target_idx - W + 1 : target_idx + 1]
         
-        w_slices = np.zeros((N_valid, W, M), dtype=np.float32)
-        for idx_out, target_idx in enumerate(valid_indices):
-            w_slices[idx_out] = X_all[target_idx - W + 1 : target_idx + 1]
-            
-        z_mean = np.mean(w_slices, axis=1)
-        a = np.sum(t_dev[:, None] * w_slices, axis=1) / sum_t_dev_sq
-        b = z_mean - a * t_mean
-        
-        y_line = a[:, None, :] * t[None, :, None] + b[:, None, :]
-        residuals = y_line - w_slices
-        c = np.sqrt(np.mean(residuals**2, axis=1))
-        
-        features_list.extend([a, b, c])
-        
-    z_curr = X_all[valid_indices]
-    features_list.append(z_curr)
+    z_mean = np.mean(windows, axis=1) # (N_valid, M)
+    a = np.sum(t_dev[:, None] * windows, axis=1) / sum_t_dev_sq # Slope a: (N_valid, M)
+    b = z_mean - a * t_mean # Intercept b: (N_valid, M)
     
-    X_features = np.concatenate(features_list, axis=1)
+    y_line = a[:, None, :] * t[None, :, None] + b[:, None, :]
+    residuals = y_line - windows
+    c = np.sqrt(np.mean(residuals**2, axis=1)) # RMSE c: (N_valid, M)
+    
+    z_curr = windows[:, -1, :] # Current value z(W-1): (N_valid, M)
+    
+    X_features = np.concatenate([a, b, c, z_curr], axis=1)
     y_targets = y_all[valid_indices].reshape(-1, 1)
     
     return X_features, y_targets
@@ -170,13 +162,9 @@ class TrendTabularDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-# --- 6. MULTI-WINDOW FEED-FORWARD NEURAL NETWORK ARCHITECTURE ---
-class MultiWindowTrendFFNN(nn.Module):
-    def __init__(self, input_dim, hidden_dims=[256, 128, 64], dropout_rate=0.35):
-        """
-        Deep Regularized FFNN designed to process multi-window trend features
-        (a_30, b_30, c_30, a_60, b_60, c_60, a_90, b_90, c_90, z_curr).
-        """
+# --- 6. FEED-FORWARD NEURAL NETWORK ARCHITECTURE (FFNN / MLP) ---
+class TrendFFNN(nn.Module):
+    def __init__(self, input_dim, hidden_dims=[128, 64, 32], dropout_rate=0.25):
         super().__init__()
         layers = []
         prev_dim = input_dim
@@ -239,6 +227,9 @@ def evaluate_dataset(model, data_loader, device):
             total_mae += mae_val.item()
             total_samples += batch_size
             
+    if total_samples == 0:
+        return 0.0, 0.0
+        
     avg_mape = total_mape / total_samples
     avg_mae = total_mae / total_samples
     return avg_mape, avg_mae
@@ -246,7 +237,7 @@ def evaluate_dataset(model, data_loader, device):
 
 # --- 7. Training Loop ---
 def train_and_evaluate_ffnn(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
-    train_criterion = nn.SmoothL1Loss(beta=2.0) # Huber Loss for stable trend regression
+    train_criterion = nn.SmoothL1Loss(beta=2.0) # Huber Loss per regressione stabili dei trend
         
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
@@ -305,7 +296,7 @@ def train_and_evaluate_ffnn(model, train_loader, val_loader, test_loader, exp_co
     final_val_mape, final_val_mae = evaluate_dataset(model, val_loader, device)
     final_test_mape, final_test_mae = evaluate_dataset(model, test_loader, device)
     
-    print(f"--> [MULTI-WINDOW RESULT] {exp_name} | "
+    print(f"--> [FFNN W={WINDOW_SIZE} RESULT] {exp_name} | "
           f"Train MAE: {final_train_mae:.2f}d | Val MAE: {final_val_mae:.2f}d | Test MAE: {final_test_mae:.2f}d | "
           f"Test MAPE: {final_test_mape:.2f}%")
     
@@ -325,10 +316,11 @@ def main():
         pid_all, time_all, train_ratio=0.5, val_ratio=0.1, mode=SPLIT_MODE
     )
     
-    # 3. Extract Multi-Window Linear Regression Features (W = [30, 60, 90])
-    X_train_raw, y_train = extract_multi_window_trend_features(X_all, y_all, pid_all, train_mask, windows=WINDOWS)
-    X_val_raw, y_val = extract_multi_window_trend_features(X_all, y_all, pid_all, val_mask, windows=WINDOWS)
-    X_test_raw, y_test = extract_multi_window_trend_features(X_all, y_all, pid_all, test_mask, windows=WINDOWS)
+    # 3. Extract Linear Regression Trend Features for W = 60
+    W = WINDOW_SIZE
+    X_train_raw, y_train = extract_linear_regression_features(X_all, y_all, pid_all, train_mask, W=W)
+    X_val_raw, y_val = extract_linear_regression_features(X_all, y_all, pid_all, val_mask, W=W)
+    X_test_raw, y_test = extract_linear_regression_features(X_all, y_all, pid_all, test_mask, W=W)
     
     # Standardization strictly computed on Train partition
     mean = X_train_raw.mean(axis=0, keepdims=True)
@@ -349,24 +341,24 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
     input_dim = X_train_scaled.shape[1]
-    print(f"Multi-Window Tabular Input Dimension (W={WINDOWS}): {input_dim} features.")
+    print(f"Tabular Input Dimension for FFNN (W={W}): {input_dim} features.")
     
-    # 5. Define Multi-Window FFNN Experiments
+    # 5. Define FFNN Experiments
     experiments = [
         {
-            "name": f"MultiWindowFFNN_Standard_W30_60_90",
+            "name": f"TrendFFNN_Standard_W{W}",
             "hidden_dims": [128, 64, 32],
-            "dropout": 0.30
-        },
-        {
-            "name": f"MultiWindowFFNN_Compact_W30_60_90",
-            "hidden_dims": [64, 32],
             "dropout": 0.25
         },
         {
-            "name": f"MultiWindowFFNN_Deep_W30_60_90",
+            "name": f"TrendFFNN_Compact_W{W}",
+            "hidden_dims": [64, 32],
+            "dropout": 0.20
+        },
+        {
+            "name": f"TrendFFNN_Deep_W{W}",
             "hidden_dims": [256, 128, 64, 32],
-            "dropout": 0.35
+            "dropout": 0.30
         }
     ]
     
@@ -377,7 +369,7 @@ def main():
         name = exp["name"]
         print(f"\nConfiguring Experiment: {name}...")
         
-        model = MultiWindowTrendFFNN(
+        model = TrendFFNN(
             input_dim=input_dim,
             hidden_dims=exp["hidden_dims"],
             dropout_rate=exp["dropout"]
@@ -402,20 +394,20 @@ def main():
     df_results = pd.DataFrame(results)
     
     print("\n" + "="*110)
-    print(f" FINAL PERFORMANCE EVALUATION TABLE (MULTI-WINDOW FFNN MODEL, WINDOWS = {WINDOWS})")
+    print(f" FINAL PERFORMANCE EVALUATION TABLE (FFNN TREND MODEL, W = {W})")
     print("="*110)
     print(df_results.to_string(index=False))
     print("="*110)
     
     # Save table to CSV
-    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_multi_window_W30_60_90.csv")
+    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_ffnn_trend_W{W}.csv")
     df_results.to_csv(csv_out_path, index=False)
     print(f"\nResults table saved to CSV: {csv_out_path}")
     
     # --- PLOT 1: FINAL TEST MAE BAR CHART ---
     plt.figure(figsize=(10, 6))
     bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAE (days)"], color=['#2b5c8f', '#d95f02', '#7570b3'])
-    plt.title(f"Final Test MAE Evaluation in Days (Multi-Window FFNN, W = {WINDOWS})", fontsize=13, fontweight='bold')
+    plt.title(f"Final Test MAE Evaluation in Days (Trend FFNN, W = {W})", fontsize=13, fontweight='bold')
     plt.ylabel("Mean Absolute Error (MAE) in Days", fontsize=11)
     plt.xticks(rotation=10, ha="right")
     
@@ -428,7 +420,7 @@ def main():
         plt.text(bar.get_x() + bar.get_width()/2.0, yval + (max_mae * 0.02), f"{yval:.2f}d", ha='center', va='bottom', fontweight='bold')
         
     plt.subplots_adjust(bottom=0.25, top=0.90)
-    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mae_multi_window_W30_60_90.png")
+    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mae_ffnn_trend_W{W}.png")
     plt.savefig(bar_plot_path, bbox_inches='tight')
     print(f"Performance bar chart saved to: {bar_plot_path}")
     
@@ -437,13 +429,13 @@ def main():
     for name, hist in val_histories.items():
         plt.plot(range(1, len(hist) + 1), hist, label=f"{name}")
         
-    plt.title(f"Validation MAE Curves per Epoch in Days (Multi-Window FFNN, W = {WINDOWS})", fontsize=13)
+    plt.title(f"Validation MAE Curves per Epoch in Days (Trend FFNN, W = {W})", fontsize=13)
     plt.xlabel("Epoch", fontsize=11)
     plt.ylabel("Validation MAE (Days)", fontsize=11)
     plt.legend()
     plt.grid(True, ls="--")
     plt.tight_layout()
-    curve_plot_path = os.path.join(CACHE_DIR, f"val_mae_learning_curves_multi_window_W30_60_90.png")
+    curve_plot_path = os.path.join(CACHE_DIR, f"val_mae_learning_curves_ffnn_trend_W{W}.png")
     plt.savefig(curve_plot_path)
     print(f"Validation learning curves plot saved to: {curve_plot_path}")
 
