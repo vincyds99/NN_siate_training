@@ -17,8 +17,8 @@ BATCH_SIZE = 128
 LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 1e-2  # L2 Regularization to enforce small weights
 
-# Single Window size W = 30
-WINDOW_SIZE = 30 
+# Single Window size set to W = 60
+WINDOW_SIZE = 60 
 SPLIT_MODE = "per_patient_temporal"
 
 # --- 1. Custom Loss & Metrics ---
@@ -98,8 +98,8 @@ def create_temporal_split_masks(pid_all, time_all, train_ratio=0.5, val_ratio=0.
     return train_mask, val_mask, test_mask
 
 
-# --- 4. Linear Regression Feature Extractor for W = 30 ---
-def extract_linear_regression_features(X_all, y_all, pid_all, target_mask, W=30):
+# --- 4. Linear Regression Feature Extractor for W = 60 ---
+def extract_linear_regression_features(X_all, y_all, pid_all, target_mask, W=60):
     N = len(pid_all)
     M = X_all.shape[1]
     pids_arr = np.array(pid_all)
@@ -318,7 +318,7 @@ def train_and_evaluate_ffnn(model, train_loader, val_loader, test_loader, exp_co
         current_lr = optimizer.param_groups[0]['lr']
         if (epoch + 1) % 10 == 0 or epoch == 0:
             train_mape, train_mae = evaluate_dataset(model, train_loader, device)
-            print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | LR: {current_lr:.1e} | "
+            print(f"Epoch {epoch+1:04d}/{EPOCHS:04d} | LR: {current_lr:.1e} | "
                   f"Train MAE: {train_mae:.2f}d | Val MAE: {val_mae:.2f}d (Best Val: {best_val_mae:.2f}d)")
         
         early_stopping(val_mae)
@@ -354,7 +354,7 @@ def main():
         pid_all, time_all, train_ratio=0.5, val_ratio=0.1, mode=SPLIT_MODE
     )
     
-    # 3. Extract Linear Regression Trend Features for W = 30
+    # 3. Extract Linear Regression Trend Features for W = 60
     W = WINDOW_SIZE
     X_train_raw, y_train = extract_linear_regression_features(X_all, y_all, pid_all, train_mask, W=W)
     X_val_raw, y_val = extract_linear_regression_features(X_all, y_all, pid_all, val_mask, W=W)
@@ -381,7 +381,7 @@ def main():
     input_dim = X_train_scaled.shape[1]
     print(f"Tabular Input Dimension n (W={W}): {input_dim} features (4 x {input_dim//4} measures).")
     
-    # 5. Experiments implementing Professor Tronci's guidance
+    # 5. Experiments implementing Professor Tronci's guidance for W=60
     experiments = [
         {
             "name": f"DirectLinearFFNN_n_to_1_W{W}",
