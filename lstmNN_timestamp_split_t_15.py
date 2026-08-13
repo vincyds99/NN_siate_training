@@ -12,16 +12,16 @@ DEFAULT_CSV = r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
 CSV_PATH = DEFAULT_CSV if os.path.exists(DEFAULT_CSV) else r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
 CACHE_DIR = r"c:\Users\vince\Desktop\NN"
 
-EPOCHS = 350
+EPOCHS = 1500
 BATCH_SIZE = 128
-LEARNING_RATE = 3e-4
-WEIGHT_DECAY = 1e-2 # Regolarizzazione L2 per evitare overfitting
+LEARNING_RATE = 5e-4
+WEIGHT_DECAY = 1e-2  # L2 Regularization to enforce small weights
 
-# Single Window size set to W = 60 as requested by the professor
-WINDOW_SIZE = 60 
+# Single Window size W = 30
+WINDOW_SIZE = 30 
 SPLIT_MODE = "per_patient_temporal"
 
-# --- 1. Custom Metrics & Loss ---
+# --- 1. Custom Loss & Metrics ---
 class MAPELoss(nn.Module):
     def __init__(self, min_val=10.0):
         super().__init__()
@@ -73,7 +73,7 @@ def create_temporal_split_masks(pid_all, time_all, train_ratio=0.5, val_ratio=0.
     test_mask = np.zeros(n_samples, dtype=bool)
 
     if mode == "per_patient_temporal":
-        print("Executing Per-Patient Chronological Temporal Split (60% past / 40% future per patient)...")
+        print("Executing Per-Patient Chronological Temporal Split (50% Train / 10% Val / 40% Test)...")
         unique_pids = np.unique(pid_all)
         
         for pid in unique_pids:
@@ -91,19 +91,15 @@ def create_temporal_split_masks(pid_all, time_all, train_ratio=0.5, val_ratio=0.
             val_mask[val_idx_p] = True
             test_mask[test_idx_p] = True
 
-    print(f"Temporal Split Summary: Train = {train_mask.sum()} samples ({train_mask.mean()*100:.1f}%) | "
-          f"Val = {val_mask.sum()} samples ({val_mask.mean()*100:.1f}%) | "
-          f"Test = {test_mask.sum()} samples ({test_mask.mean()*100:.1f}%)")
+    print(f"Temporal Split Summary: Train = {train_mask.sum()} ({train_mask.mean()*100:.1f}%) | "
+          f"Val = {val_mask.sum()} ({val_mask.mean()*100:.1f}%) | "
+          f"Test = {test_mask.sum()} ({test_mask.mean()*100:.1f}%)")
           
     return train_mask, val_mask, test_mask
 
 
-# --- 4. Linear Regression Feature Extractor for W = 60 ---
-def extract_linear_regression_features(X_all, y_all, pid_all, target_mask, W=60):
-    """
-    Extracts linear regression trend features (a, b, c) and current value z_curr for W=60.
-    Ensures targets in target_mask have at least W preceding past sessions of the same patient.
-    """
+# --- 4. Linear Regression Feature Extractor for W = 30 ---
+def extract_linear_regression_features(X_all, y_all, pid_all, target_mask, W=30):
     N = len(pid_all)
     M = X_all.shape[1]
     pids_arr = np.array(pid_all)
@@ -111,7 +107,6 @@ def extract_linear_regression_features(X_all, y_all, pid_all, target_mask, W=60)
     print(f"Extracting Linear Regression Trend Features (a, b, c, z_curr) for W = {W}...")
     t0 = time.time()
     
-    # Target index must be in target_mask AND have W preceding sessions of the same patient
     same_patient = (pids_arr[W - 1:] == pids_arr[: N - W + 1])
     target_in_set = target_mask[W - 1:]
     
@@ -119,7 +114,7 @@ def extract_linear_regression_features(X_all, y_all, pid_all, target_mask, W=60)
     valid_indices = np.where(valid_flags)[0] + (W - 1)
     
     N_valid = len(valid_indices)
-    print(f"Extracted {N_valid} valid targets for W={W} in {time.time() - t0:.2f}s.")
+    print(f"Extracted {N_valid} valid target samples for W={W} in {time.time() - t0:.2f}s.")
     
     if N_valid == 0:
         return np.empty((0, 4 * M), dtype=np.float32), np.empty((0, 1), dtype=np.float32)
@@ -133,15 +128,15 @@ def extract_linear_regression_features(X_all, y_all, pid_all, target_mask, W=60)
     for idx_out, target_idx in enumerate(valid_indices):
         windows[idx_out] = X_all[target_idx - W + 1 : target_idx + 1]
         
-    z_mean = np.mean(windows, axis=1) # (N_valid, M)
-    a = np.sum(t_dev[:, None] * windows, axis=1) / sum_t_dev_sq # Slope a: (N_valid, M)
-    b = z_mean - a * t_mean # Intercept b: (N_valid, M)
+    z_mean = np.mean(windows, axis=1)
+    a = np.sum(t_dev[:, None] * windows, axis=1) / sum_t_dev_sq
+    b = z_mean - a * t_mean
     
     y_line = a[:, None, :] * t[None, :, None] + b[:, None, :]
     residuals = y_line - windows
-    c = np.sqrt(np.mean(residuals**2, axis=1)) # RMSE c: (N_valid, M)
+    c = np.sqrt(np.mean(residuals**2, axis=1))
     
-    z_curr = windows[:, -1, :] # Current value z(W-1): (N_valid, M)
+    z_curr = windows[:, -1, :]
     
     X_features = np.concatenate([a, b, c, z_curr], axis=1)
     y_targets = y_all[valid_indices].reshape(-1, 1)
@@ -162,24 +157,65 @@ class TrendTabularDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-# --- 6. FEED-FORWARD NEURAL NETWORK ARCHITECTURE (FFNN / MLP) ---
-class TrendFFNN(nn.Module):
-    def __init__(self, input_dim, hidden_dims=[128, 64, 32], dropout_rate=0.25):
+# --- 6. SMALL ARCHITECTURES RECOMMENDED BY THE PROFESSOR ---
+
+class DirectLinearFFNN(nn.Module):
+    """
+    Ultra-aggressive 2-layer approach: Input (n) -> Output (1) directly.
+    Single neuron / Linear model to strictly prevent memorizing data.
+    """
+    def __init__(self, input_dim):
         super().__init__()
-        layers = []
-        prev_dim = input_dim
+        self.net = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Small3LayerFFNN(nn.Module):
+    """
+    3-layer approach recommended by Professor Tronci:
+    Layer 1: Input n
+    Layer 2: ~n/10 nodes
+    Layer 3: 3 nodes
+    Layer 4 (Output): 1 node
+    """
+    def __init__(self, input_dim, dropout_rate=0.10):
+        super().__init__()
+        layer2_dim = max(int(input_dim / 10), 4) # n/10 nodes
+        layer3_dim = 3                        # 3 nodes
         
-        for h_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, h_dim),
-                nn.LayerNorm(h_dim),
-                nn.GELU(),
-                nn.Dropout(dropout_rate)
-            ])
-            prev_dim = h_dim
-            
-        layers.append(nn.Linear(prev_dim, 1))
-        self.net = nn.Sequential(*layers)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, layer2_dim),
+            nn.LayerNorm(layer2_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(layer2_dim, layer3_dim),
+            nn.LayerNorm(layer3_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(layer3_dim, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Micro2LayerFFNN(nn.Module):
+    """
+    Micro 2-layer approach: Input n -> ~n/10 nodes -> Output 1 node.
+    """
+    def __init__(self, input_dim, dropout_rate=0.10):
+        super().__init__()
+        layer2_dim = max(int(input_dim / 10), 4)
+        
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, layer2_dim),
+            nn.LayerNorm(layer2_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(layer2_dim, 1)
+        )
 
     def forward(self, x):
         return self.net(x)
@@ -187,7 +223,7 @@ class TrendFFNN(nn.Module):
 
 # --- Early Stopping Helper ---
 class EarlyStoppingMAE:
-    def __init__(self, patience=30, min_delta=0.0):
+    def __init__(self, patience=50, min_delta=0.0):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
@@ -237,17 +273,19 @@ def evaluate_dataset(model, data_loader, device):
 
 # --- 7. Training Loop ---
 def train_and_evaluate_ffnn(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
-    train_criterion = nn.SmoothL1Loss(beta=2.0) # Huber Loss per regressione stabili dei trend
+    train_criterion = nn.SmoothL1Loss(beta=2.0)
         
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     
     val_mae_hist = []
     best_val_mae = float('inf')
-    early_stopping = EarlyStoppingMAE(patience=30)
+    early_stopping = EarlyStoppingMAE(patience=50)
     weights_path = os.path.join(CACHE_DIR, f"best_weights_{exp_name}.pth")
     
     print(f"\n--- Training {exp_name} on {device} ---")
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total Trainable Parameters in {exp_name}: {num_params}")
     
     for epoch in range(EPOCHS):
         model.train()
@@ -278,7 +316,7 @@ def train_and_evaluate_ffnn(model, train_loader, val_loader, test_loader, exp_co
             torch.save(model.state_dict(), weights_path)
             
         current_lr = optimizer.param_groups[0]['lr']
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        if (epoch + 1) % 10 == 0 or epoch == 0:
             train_mape, train_mae = evaluate_dataset(model, train_loader, device)
             print(f"Epoch {epoch+1:03d}/{EPOCHS:03d} | LR: {current_lr:.1e} | "
                   f"Train MAE: {train_mae:.2f}d | Val MAE: {val_mae:.2f}d (Best Val: {best_val_mae:.2f}d)")
@@ -296,7 +334,7 @@ def train_and_evaluate_ffnn(model, train_loader, val_loader, test_loader, exp_co
     final_val_mape, final_val_mae = evaluate_dataset(model, val_loader, device)
     final_test_mape, final_test_mae = evaluate_dataset(model, test_loader, device)
     
-    print(f"--> [FFNN W={WINDOW_SIZE} RESULT] {exp_name} | "
+    print(f"--> [SMALL FFNN W={WINDOW_SIZE} RESULT] {exp_name} | "
           f"Train MAE: {final_train_mae:.2f}d | Val MAE: {final_val_mae:.2f}d | Test MAE: {final_test_mae:.2f}d | "
           f"Test MAPE: {final_test_mape:.2f}%")
     
@@ -316,7 +354,7 @@ def main():
         pid_all, time_all, train_ratio=0.5, val_ratio=0.1, mode=SPLIT_MODE
     )
     
-    # 3. Extract Linear Regression Trend Features for W = 60
+    # 3. Extract Linear Regression Trend Features for W = 30
     W = WINDOW_SIZE
     X_train_raw, y_train = extract_linear_regression_features(X_all, y_all, pid_all, train_mask, W=W)
     X_val_raw, y_val = extract_linear_regression_features(X_all, y_all, pid_all, val_mask, W=W)
@@ -341,24 +379,21 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
     input_dim = X_train_scaled.shape[1]
-    print(f"Tabular Input Dimension for FFNN (W={W}): {input_dim} features.")
+    print(f"Tabular Input Dimension n (W={W}): {input_dim} features (4 x {input_dim//4} measures).")
     
-    # 5. Define FFNN Experiments
+    # 5. Experiments implementing Professor Tronci's guidance
     experiments = [
         {
-            "name": f"TrendFFNN_Standard_W{W}",
-            "hidden_dims": [128, 64, 32],
-            "dropout": 0.25
+            "name": f"DirectLinearFFNN_n_to_1_W{W}",
+            "type": "direct_linear"
         },
         {
-            "name": f"TrendFFNN_Compact_W{W}",
-            "hidden_dims": [64, 32],
-            "dropout": 0.20
+            "name": f"Small3LayerFFNN_n_n10_3_1_W{W}",
+            "type": "small_3layer"
         },
         {
-            "name": f"TrendFFNN_Deep_W{W}",
-            "hidden_dims": [256, 128, 64, 32],
-            "dropout": 0.30
+            "name": f"Micro2LayerFFNN_n_n10_1_W{W}",
+            "type": "micro_2layer"
         }
     ]
     
@@ -369,12 +404,13 @@ def main():
         name = exp["name"]
         print(f"\nConfiguring Experiment: {name}...")
         
-        model = TrendFFNN(
-            input_dim=input_dim,
-            hidden_dims=exp["hidden_dims"],
-            dropout_rate=exp["dropout"]
-        ).to(device)
-        
+        if exp["type"] == "direct_linear":
+            model = DirectLinearFFNN(input_dim=input_dim).to(device)
+        elif exp["type"] == "small_3layer":
+            model = Small3LayerFFNN(input_dim=input_dim, dropout_rate=0.10).to(device)
+        elif exp["type"] == "micro_2layer":
+            model = Micro2LayerFFNN(input_dim=input_dim, dropout_rate=0.10).to(device)
+            
         val_mae_hist, train_mape, train_mae, val_mape, val_mae, test_mape, test_mae = train_and_evaluate_ffnn(
             model, train_loader, val_loader, test_loader, exp, name, device
         )
@@ -394,22 +430,22 @@ def main():
     df_results = pd.DataFrame(results)
     
     print("\n" + "="*110)
-    print(f" FINAL PERFORMANCE EVALUATION TABLE (FFNN TREND MODEL, W = {W})")
+    print(f" FINAL PERFORMANCE EVALUATION TABLE (SMALL FFNN MODELS, W = {W})")
     print("="*110)
     print(df_results.to_string(index=False))
     print("="*110)
     
     # Save table to CSV
-    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_ffnn_trend_W{W}.csv")
+    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_ffnn_small_W{W}.csv")
     df_results.to_csv(csv_out_path, index=False)
     print(f"\nResults table saved to CSV: {csv_out_path}")
     
     # --- PLOT 1: FINAL TEST MAE BAR CHART ---
     plt.figure(figsize=(10, 6))
     bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAE (days)"], color=['#2b5c8f', '#d95f02', '#7570b3'])
-    plt.title(f"Final Test MAE Evaluation in Days (Trend FFNN, W = {W})", fontsize=13, fontweight='bold')
+    plt.title(f"Final Test MAE Evaluation in Days (Small FFNNs, W = {W})", fontsize=13, fontweight='bold')
     plt.ylabel("Mean Absolute Error (MAE) in Days", fontsize=11)
-    plt.xticks(rotation=10, ha="right")
+    plt.xticks(rotation=15, ha="right")
     
     max_mae = df_results["Test MAE (days)"].max()
     plt.ylim(0, max_mae * 1.15)
@@ -420,7 +456,7 @@ def main():
         plt.text(bar.get_x() + bar.get_width()/2.0, yval + (max_mae * 0.02), f"{yval:.2f}d", ha='center', va='bottom', fontweight='bold')
         
     plt.subplots_adjust(bottom=0.25, top=0.90)
-    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mae_ffnn_trend_W{W}.png")
+    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mae_ffnn_small_W{W}.png")
     plt.savefig(bar_plot_path, bbox_inches='tight')
     print(f"Performance bar chart saved to: {bar_plot_path}")
     
@@ -429,13 +465,13 @@ def main():
     for name, hist in val_histories.items():
         plt.plot(range(1, len(hist) + 1), hist, label=f"{name}")
         
-    plt.title(f"Validation MAE Curves per Epoch in Days (Trend FFNN, W = {W})", fontsize=13)
+    plt.title(f"Validation MAE Curves per Epoch in Days (Small FFNNs, W = {W})", fontsize=13)
     plt.xlabel("Epoch", fontsize=11)
     plt.ylabel("Validation MAE (Days)", fontsize=11)
     plt.legend()
     plt.grid(True, ls="--")
     plt.tight_layout()
-    curve_plot_path = os.path.join(CACHE_DIR, f"val_mae_learning_curves_ffnn_trend_W{W}.png")
+    curve_plot_path = os.path.join(CACHE_DIR, f"val_mae_learning_curves_ffnn_small_W{W}.png")
     plt.savefig(curve_plot_path)
     print(f"Validation learning curves plot saved to: {curve_plot_path}")
 
