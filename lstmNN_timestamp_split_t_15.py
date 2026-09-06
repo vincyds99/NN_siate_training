@@ -7,473 +7,440 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-# --- Configurations ---
-DEFAULT_CSV = r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
-CSV_PATH = DEFAULT_CSV if os.path.exists(DEFAULT_CSV) else r"c:\Users\vince\Desktop\NN\NN_training_dataset.csv"
-CACHE_DIR = r"c:\Users\vince\Desktop\NN"
+# --- 1. Configurations and File Paths ---
+BASE_DIR = r"c:\Users\vince\Desktop\NN"
+DATASETS_DIR = os.path.join(BASE_DIR, "datasets") if os.path.exists(os.path.join(BASE_DIR, "datasets")) else "datasets"
 
-EPOCHS = 1500
+# The 6 dataset files with priority to W=60
+DATASET_FILES = [
+    {"name": "44misure_capped360_W60", "file": "NN_training_dataset_W60_44_capped360", "W": 60, "capped": True},
+    {"name": "26misure_capped360_W60", "file": "NN_training_dataset_W60_26_capped360", "W": 60, "capped": True},
+    {"name": "26misure_uncapped_W60",  "file": "NN_training_dataset_W60_26_uncapped",  "W": 60, "capped": False},
+    {"name": "44misure_capped360_W30", "file": "NN_training_dataset_W30_44_capped360", "W": 30, "capped": True},
+    {"name": "26misure_capped360_W30", "file": "NN_training_dataset_W30_26_capped360", "W": 30, "capped": True},
+    {"name": "26misure_uncapped_W30",  "file": "NN_training_dataset_W30_26_uncapped",  "W": 30, "capped": False},
+]
+
+SPLIT_MODES = ["temporal", "patient_wise"]
+EPOCHS = 1000
 BATCH_SIZE = 128
-LEARNING_RATE = 5e-4
-WEIGHT_DECAY = 1e-2  # L2 Regularization to enforce small weights
+LEARNING_RATE = 4e-4
+WEIGHT_DECAY = 2e-2
+EARLY_STOPPING_PATIENCE = 40
+TTE_CAP_DAYS = 360.0
 
-# Single Window size set to W = 60
-WINDOW_SIZE = 60 
-SPLIT_MODE = "per_patient_temporal"
 
-# --- 1. Custom Loss & Metrics ---
-class MAPELoss(nn.Module):
-    def __init__(self, min_val=10.0):
+# --- 2. Feed-Forward Architecture (N -> H -> 1) ---
+class SystematicFFNN(nn.Module):
+    """
+    Fixed N inputs (4 * M: slope a, intercept b, RMSE c, current value z),
+    variable hidden nodes H (starting from 1, 2, 3 up to N),
+    fixed 1 output predicting log(TTE).
+    """
+    def __init__(self, input_dim, hidden_dim, dropout_rate=0.20, noise_std=0.03):
         super().__init__()
-        self.min_val = min_val
+        self.noise_std = noise_std
+        self.hidden_dim = hidden_dim
+        
+        # When hidden_dim == 1, LayerNorm across dimension 1 would zero out outputs.
+        # Thus, LayerNorm is applied only for hidden_dim > 1.
+        if hidden_dim == 1:
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, 1),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(1, 1)
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(hidden_dim, 1)
+            )
 
-    def forward(self, outputs, targets):
-        denom = torch.clamp(targets, min=self.min_val)
-        absolute_percentage_errors = torch.abs(outputs - targets) / denom
-        return torch.mean(absolute_percentage_errors) * 100.0
+    def forward(self, x):
+        if self.training and self.noise_std > 0:
+            x = x + torch.randn_like(x) * self.noise_std
+        return self.net(x)
 
 
-# --- 2. Data Preparation ---
-def load_and_preprocess_data():
-    print(f"Parsing CSV file: {CSV_PATH}")
-    t_start = time.time()
-    df = pd.read_csv(CSV_PATH)
-    print(f"Loaded CSV file in {time.time() - t_start:.2f}s. Initial row count: {len(df)}")
+# --- 3. Data Loading & Feature Extraction (N = 4 * M) ---
+def find_dataset_file(datasets_dir, base_name):
+    candidates = [
+        os.path.join(datasets_dir, base_name),
+        os.path.join(datasets_dir, base_name + ".csv"),
+        os.path.join(datasets_dir, base_name + ".CSV"),
+        os.path.join(BASE_DIR, base_name),
+        os.path.join(BASE_DIR, base_name + ".csv"),
+        os.path.join(".", base_name),
+        os.path.join(".", base_name + ".csv"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return os.path.join(datasets_dir, base_name + ".csv")
+
+
+def load_dataset(file_path):
+    print(f"\n[DATA LOADER] Reading file: {file_path}")
+    t0 = time.time()
+    df = pd.read_csv(file_path)
+    print(f"Loaded {len(df)} rows and {len(df.columns)} columns in {time.time() - t0:.2f}s.")
     
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    print("Sorting rows chronologically by patient_id and timestamp...")
-    df = df.sort_values(by=['patient_id', 'timestamp']).reset_index(drop=True)
+    # Dynamically resolve patient ID column spelling
+    pid_col = 'partient_id' if 'partient_id' in df.columns else 'patient_id'
     
-    def parse_vector_column(series):
-        t0 = time.time()
-        all_str = ",".join(series.str.strip('{}'))
-        parsed = np.fromstring(all_str, sep=',', dtype=np.float32)
-        reshaped = parsed.reshape(len(series), -1)
-        print(f"Parsed column '{series.name}' in {time.time() - t0:.2f}s. Feature size: {reshaped.shape[1]}")
-        return reshaped
-
-    print("Parsing vector column 'misure'...")
-    t_parse = time.time()
-    misure = parse_vector_column(df['misure'])
-    print(f"Total vector parsing completed in {time.time() - t_parse:.2f}s.")
-    
-    X_all = misure
-    y_all = df['tte'].values.astype(np.float32)
-    pid_all = df['patient_id'].values
-    time_all = df['timestamp'].values
-    
-    return X_all, y_all, pid_all, time_all
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        if pid_col in df.columns:
+            df = df.sort_values(by=[pid_col, 'timestamp']).reset_index(drop=True)
+            
+    return df, pid_col
 
 
-# --- 3. Temporal Patient-wise Dataset Split Masks ---
-def create_temporal_split_masks(pid_all, time_all, train_ratio=0.5, val_ratio=0.1, mode="per_patient_temporal"):
+def prepare_raw_data(df, pid_col):
+    pid_all = df[pid_col].values
+    time_all = df['timestamp'].values if 'timestamp' in df.columns else np.arange(len(df))
+    y_raw_days = df['tte'].values.astype(np.float32)
+    
+    # Target: use log_tte column directly if present, otherwise compute log(1 + TTE)
+    if 'log_tte' in df.columns:
+        y_log = df['log_tte'].values.astype(np.float32)
+    else:
+        y_log = np.log(np.maximum(y_raw_days, 1.0))
+        
+    all_str = ",".join(df['misure'].str.strip('{}'))
+    parsed = np.fromstring(all_str, sep=',', dtype=np.float32)
+    X_raw = parsed.reshape(len(df), -1)
+    
+    return X_raw, y_log, y_raw_days, pid_all, time_all
+
+
+def create_split_masks(pid_all, time_all, split_mode="temporal", train_ratio=0.5, val_ratio=0.1):
     n_samples = len(pid_all)
     train_mask = np.zeros(n_samples, dtype=bool)
     val_mask = np.zeros(n_samples, dtype=bool)
     test_mask = np.zeros(n_samples, dtype=bool)
-
-    if mode == "per_patient_temporal":
-        print("Executing Per-Patient Chronological Temporal Split (50% Train / 10% Val / 40% Test)...")
-        unique_pids = np.unique(pid_all)
-        
+    unique_pids = np.unique(pid_all)
+    
+    if split_mode == "temporal":
         for pid in unique_pids:
             p_indices = np.where(pid_all == pid)[0]
             n_p = len(p_indices)
+            n_tr = int(n_p * train_ratio)
+            n_va = int(n_p * val_ratio)
             
-            n_train = int(n_p * train_ratio)
-            n_val = int(n_p * val_ratio)
+            train_mask[p_indices[:n_tr]] = True
+            val_mask[p_indices[n_tr : n_tr + n_va]] = True
+            test_mask[p_indices[n_tr + n_va :]] = True
             
-            train_idx_p = p_indices[:n_train]
-            val_idx_p = p_indices[n_train : n_train + n_val]
-            test_idx_p = p_indices[n_train + n_val :]
-            
-            train_mask[train_idx_p] = True
-            val_mask[val_idx_p] = True
-            test_mask[test_idx_p] = True
-
-    print(f"Temporal Split Summary: Train = {train_mask.sum()} ({train_mask.mean()*100:.1f}%) | "
-          f"Val = {val_mask.sum()} ({val_mask.mean()*100:.1f}%) | "
-          f"Test = {test_mask.sum()} ({test_mask.mean()*100:.1f}%)")
-          
+    elif split_mode == "patient_wise":
+        n_pids = len(unique_pids)
+        rng = np.random.RandomState(42)
+        shuffled_pids = rng.permutation(unique_pids)
+        
+        n_tr_pids = int(n_pids * train_ratio)
+        n_va_pids = int(n_pids * val_ratio)
+        
+        train_pids = set(shuffled_pids[:n_tr_pids])
+        val_pids = set(shuffled_pids[n_tr_pids : n_tr_pids + n_va_pids])
+        test_pids = set(shuffled_pids[n_tr_pids + n_va_pids :])
+        
+        for idx, pid in enumerate(pid_all):
+            if pid in train_pids:
+                train_mask[idx] = True
+            elif pid in val_pids:
+                val_mask[idx] = True
+            elif pid in test_pids:
+                test_mask[idx] = True
+                
     return train_mask, val_mask, test_mask
 
 
-# --- 4. Linear Regression Feature Extractor for W = 60 ---
-def extract_linear_regression_features(X_all, y_all, pid_all, target_mask, W=60):
-    N = len(pid_all)
-    M = X_all.shape[1]
+def extract_features(X_all, y_log, y_days, pid_all, target_mask, W):
+    """
+    Checks if features are already extracted (104 or 176 features)
+    or if sliding window of size W needs to be calculated over raw sessions (26 or 44 measures).
+    Extracted features per measure: a (slope), b (intercept), c (RMSE), z (current value).
+    """
+    M_raw = X_all.shape[1]
+    
+    # Case A: Features are already pre-extracted in the CSV
+    if M_raw in [104, 176]:
+        valid_indices = np.where(target_mask)[0]
+        return X_all[valid_indices], y_log[valid_indices].reshape(-1, 1), y_days[valid_indices].reshape(-1, 1)
+        
+    # Case B: Raw measures (26 or 44) -> compute sliding window W
+    N_total = len(pid_all)
     pids_arr = np.array(pid_all)
     
-    print(f"Extracting Linear Regression Trend Features (a, b, c, z_curr) for W = {W}...")
-    t0 = time.time()
-    
-    same_patient = (pids_arr[W - 1:] == pids_arr[: N - W + 1])
+    same_patient = (pids_arr[W - 1:] == pids_arr[: N_total - W + 1])
     target_in_set = target_mask[W - 1:]
-    
     valid_flags = same_patient & target_in_set
     valid_indices = np.where(valid_flags)[0] + (W - 1)
     
     N_valid = len(valid_indices)
-    print(f"Extracted {N_valid} valid target samples for W={W} in {time.time() - t0:.2f}s.")
-    
     if N_valid == 0:
-        return np.empty((0, 4 * M), dtype=np.float32), np.empty((0, 1), dtype=np.float32)
+        return np.empty((0, 4 * M_raw), dtype=np.float32), np.empty((0, 1), dtype=np.float32), np.empty((0, 1), dtype=np.float32)
 
     t = np.arange(W, dtype=np.float32)
     t_mean = (W - 1) / 2.0
     t_dev = t - t_mean
     sum_t_dev_sq = np.sum(t_dev**2)
     
-    windows = np.zeros((N_valid, W, M), dtype=np.float32)
+    windows = np.zeros((N_valid, W, M_raw), dtype=np.float32)
     for idx_out, target_idx in enumerate(valid_indices):
         windows[idx_out] = X_all[target_idx - W + 1 : target_idx + 1]
         
     z_mean = np.mean(windows, axis=1)
     a = np.sum(t_dev[:, None] * windows, axis=1) / sum_t_dev_sq
     b = z_mean - a * t_mean
-    
     y_line = a[:, None, :] * t[None, :, None] + b[:, None, :]
     residuals = y_line - windows
-    c = np.sqrt(np.mean(residuals**2, axis=1))
-    
+    c_rmse = np.sqrt(np.mean(residuals**2, axis=1))
     z_curr = windows[:, -1, :]
     
-    X_features = np.concatenate([a, b, c, z_curr], axis=1)
-    y_targets = y_all[valid_indices].reshape(-1, 1)
-    
-    return X_features, y_targets
+    X_features = np.concatenate([a, b, c_rmse, z_curr], axis=1)
+    return X_features, y_log[valid_indices].reshape(-1, 1), y_days[valid_indices].reshape(-1, 1)
 
 
-# --- 5. PyTorch Tabular Dataset ---
-class TrendTabularDataset(Dataset):
-    def __init__(self, X_tab, y_tab):
+# --- 4. Tabular Dataset & Evaluation ---
+class TabularLogDataset(Dataset):
+    def __init__(self, X_tab, y_log, y_days):
         self.X = torch.tensor(X_tab, dtype=torch.float32)
-        self.y = torch.tensor(y_tab, dtype=torch.float32)
+        self.y_log = torch.tensor(y_log, dtype=torch.float32)
+        self.y_days = torch.tensor(y_days, dtype=torch.float32)
         
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        return self.X[idx], self.y_log[idx], self.y_days[idx]
 
 
-# --- 6. SMALL ARCHITECTURES RECOMMENDED BY THE PROFESSOR ---
-
-class DirectLinearFFNN(nn.Module):
-    """
-    Ultra-aggressive 2-layer approach: Input (n) -> Output (1) directly.
-    Single neuron / Linear model to strictly prevent memorizing data.
-    """
-    def __init__(self, input_dim):
-        super().__init__()
-        self.net = nn.Linear(input_dim, 1)
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class Small3LayerFFNN(nn.Module):
-    """
-    3-layer approach recommended by Professor Tronci:
-    Layer 1: Input n
-    Layer 2: ~n/10 nodes
-    Layer 3: 3 nodes
-    Layer 4 (Output): 1 node
-    """
-    def __init__(self, input_dim, dropout_rate=0.10):
-        super().__init__()
-        layer2_dim = max(int(input_dim / 10), 4) # n/10 nodes
-        layer3_dim = 3                        # 3 nodes
-        
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, layer2_dim),
-            nn.LayerNorm(layer2_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(layer2_dim, layer3_dim),
-            nn.LayerNorm(layer3_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(layer3_dim, 1)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class Micro2LayerFFNN(nn.Module):
-    """
-    Micro 2-layer approach: Input n -> ~n/10 nodes -> Output 1 node.
-    """
-    def __init__(self, input_dim, dropout_rate=0.10):
-        super().__init__()
-        layer2_dim = max(int(input_dim / 10), 4)
-        
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, layer2_dim),
-            nn.LayerNorm(layer2_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(layer2_dim, 1)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-# --- Early Stopping Helper ---
-class EarlyStoppingMAE:
-    def __init__(self, patience=50, min_delta=0.0):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_mae = None
-        self.early_stop = False
-
-    def __call__(self, val_mae):
-        if self.best_mae is None:
-            self.best_mae = val_mae
-        elif val_mae > self.best_mae - self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_mae = val_mae
-            self.counter = 0
-
-
-# --- Evaluation Function ---
-def evaluate_dataset(model, data_loader, device):
+def evaluate_model(model, data_loader, device, is_capped):
     model.eval()
-    mape_criterion = MAPELoss(min_val=10.0)
-    total_mape = 0.0
-    total_mae = 0.0
+    total_mae_days = 0.0
+    total_mape_days = 0.0
+    total_mae_log = 0.0
     total_samples = 0
     
     with torch.no_grad():
-        for X_batch, y_batch in data_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            outputs = model(X_batch)
+        for X_b, y_log_b, y_days_b in data_loader:
+            X_b = X_b.to(device)
+            y_log_b = y_log_b.to(device)
+            y_days_b = y_days_b.to(device)
             
-            mape_val = mape_criterion(outputs, y_batch)
-            mae_val = torch.abs(outputs - y_batch).sum()
+            preds_log = model(X_b)
+            # Inversion: exp(pred_log) guarantees strictly positive TTE values
+            preds_days = torch.exp(preds_log)
             
-            batch_size = X_batch.size(0)
-            total_mape += mape_val.item() * batch_size
-            total_mae += mae_val.item()
-            total_samples += batch_size
+            # Apply 360-day cap ONLY if the dataset is capped
+            if is_capped:
+                preds_days = torch.clamp(preds_days, max=TTE_CAP_DAYS)
+                
+            mae_days = torch.abs(preds_days - y_days_b).sum().item()
+            denom = torch.clamp(y_days_b, min=10.0)
+            mape_days = (torch.abs(preds_days - y_days_b) / denom).sum().item() * 100.0
+            mae_log = torch.abs(preds_log - y_log_b).sum().item()
+            
+            b_size = X_b.size(0)
+            total_mae_days += mae_days
+            total_mape_days += mape_days
+            total_mae_log += mae_log
+            total_samples += b_size
             
     if total_samples == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
         
-    avg_mape = total_mape / total_samples
-    avg_mae = total_mae / total_samples
-    return avg_mape, avg_mae
+    return total_mae_days / total_samples, total_mape_days / total_samples, total_mae_log / total_samples
 
 
-# --- 7. Training Loop ---
-def train_and_evaluate_ffnn(model, train_loader, val_loader, test_loader, exp_config, exp_name, device):
-    train_criterion = nn.SmoothL1Loss(beta=2.0)
-        
+# --- 5. Training Loop with Epoch Early Stopping ---
+def train_model(model, train_loader, val_loader, test_loader, device, is_capped, epochs=EPOCHS):
+    criterion = nn.SmoothL1Loss(beta=0.1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
-    val_mae_hist = []
     best_val_mae = float('inf')
-    early_stopping = EarlyStoppingMAE(patience=50)
-    weights_path = os.path.join(CACHE_DIR, f"best_weights_{exp_name}.pth")
+    best_weights = None
+    patience_counter = 0
     
-    print(f"\n--- Training {exp_name} on {device} ---")
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total Trainable Parameters in {exp_name}: {num_params}")
-    
-    for epoch in range(EPOCHS):
+    for epoch in range(epochs):
         model.train()
-        epoch_train_loss = 0.0
-        
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            
+        for X_b, y_log_b, _ in train_loader:
+            X_b, y_log_b = X_b.to(device), y_log_b.to(device)
             optimizer.zero_grad()
-            outputs = model(X_batch)
-            
-            loss = train_criterion(outputs, y_batch)
+            out_log = model(X_b)
+            loss = criterion(out_log, y_log_b)
             loss.backward()
-            
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
-            epoch_train_loss += loss.item() * X_batch.size(0)
-            
         scheduler.step()
-        epoch_train_loss /= len(train_loader.dataset)
         
-        val_mape, val_mae = evaluate_dataset(model, val_loader, device)
-        val_mae_hist.append(val_mae)
+        val_mae_d, _, _ = evaluate_model(model, val_loader, device, is_capped=is_capped)
+        if val_mae_d < best_val_mae:
+            best_val_mae = val_mae_d
+            best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= EARLY_STOPPING_PATIENCE:
+                break
+                
+    if best_weights is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_weights.items()})
         
-        if val_mae < best_val_mae:
-            best_val_mae = val_mae
-            torch.save(model.state_dict(), weights_path)
-            
-        current_lr = optimizer.param_groups[0]['lr']
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            train_mape, train_mae = evaluate_dataset(model, train_loader, device)
-            print(f"Epoch {epoch+1:04d}/{EPOCHS:04d} | LR: {current_lr:.1e} | "
-                  f"Train MAE: {train_mae:.2f}d | Val MAE: {val_mae:.2f}d (Best Val: {best_val_mae:.2f}d)")
-        
-        early_stopping(val_mae)
-        if early_stopping.early_stop:
-            print(f"Early stopping triggered at epoch {epoch+1}.")
-            break
-            
-    print(f"\n[EVALUATION] Loading optimal weights from '{weights_path}'...")
-    if os.path.exists(weights_path):
-        model.load_state_dict(torch.load(weights_path))
-        
-    final_train_mape, final_train_mae = evaluate_dataset(model, train_loader, device)
-    final_val_mape, final_val_mae = evaluate_dataset(model, val_loader, device)
-    final_test_mape, final_test_mae = evaluate_dataset(model, test_loader, device)
+    tr_mae, tr_mape, _ = evaluate_model(model, train_loader, device, is_capped=is_capped)
+    va_mae, va_mape, _ = evaluate_model(model, val_loader, device, is_capped=is_capped)
+    te_mae, te_mape, _ = evaluate_model(model, test_loader, device, is_capped=is_capped)
     
-    print(f"--> [SMALL FFNN W={WINDOW_SIZE} RESULT] {exp_name} | "
-          f"Train MAE: {final_train_mae:.2f}d | Val MAE: {final_val_mae:.2f}d | Test MAE: {final_test_mae:.2f}d | "
-          f"Test MAPE: {final_test_mape:.2f}%")
-    
-    return val_mae_hist, final_train_mape, final_train_mae, final_val_mape, final_val_mae, final_test_mape, final_test_mae
+    return tr_mae, tr_mape, va_mae, va_mape, te_mae, te_mape
 
 
-# --- 8. Main Execution Pipeline ---
+# --- 6. Architectural Pruning Controller ---
+def check_architectural_pruning(history, max_patience=2, gap_threshold=35.0, gap_growth_ratio=1.35):
+    if len(history) < 2:
+        return False, ""
+        
+    curr = history[-1]
+    prev = history[-2]
+    gap_curr = abs(curr["val_mae"] - curr["train_mae"])
+    gap_prev = abs(prev["val_mae"] - prev["train_mae"])
+    
+    # Check 1: Overfitting onset
+    if gap_curr > gap_threshold and (gap_prev == 0 or gap_curr > gap_growth_ratio * gap_prev):
+        return True, f"Overfitting trigger: |Val-Train| gap widened from {gap_prev:.1f}d to {gap_curr:.1f}d (> {gap_threshold}d)."
+        
+    # Check 2: Validation stagnation
+    best_val = min(h["val_mae"] for h in history[:-1])
+    if len(history) >= max_patience + 1:
+        recent_vals = [h["val_mae"] for h in history[-max_patience:]]
+        if all(v >= best_val + 2.0 for v in recent_vals):
+            return True, f"Validation stagnation: no improvement over {best_val:.2f}d for {max_patience} consecutive configurations."
+            
+    return False, ""
+
+
+# --- 7. Systematic Grid Search Engine ---
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Execution device: {device}")
+    print(f"\n=========================================================================")
+    print(f" SYSTEMATIC FFNN LOG(TTE) EXPLORATION ENGINE - DEVICE: {device}")
+    print(f"=========================================================================\n")
     
-    # 1. Load Data
-    X_all, y_all, pid_all, time_all = load_and_preprocess_data()
+    all_results = []
     
-    # 2. Temporal Patient-wise Split
-    train_mask, val_mask, test_mask = create_temporal_split_masks(
-        pid_all, time_all, train_ratio=0.5, val_ratio=0.1, mode=SPLIT_MODE
-    )
-    
-    # 3. Extract Linear Regression Trend Features for W = 60
-    W = WINDOW_SIZE
-    X_train_raw, y_train = extract_linear_regression_features(X_all, y_all, pid_all, train_mask, W=W)
-    X_val_raw, y_val = extract_linear_regression_features(X_all, y_all, pid_all, val_mask, W=W)
-    X_test_raw, y_test = extract_linear_regression_features(X_all, y_all, pid_all, test_mask, W=W)
-    
-    # Standardization strictly computed on Train partition
-    mean = X_train_raw.mean(axis=0, keepdims=True)
-    std = X_train_raw.std(axis=0, keepdims=True)
-    std[std == 0] = 1.0
-    
-    X_train_scaled = (X_train_raw - mean) / std
-    X_val_scaled = (X_val_raw - mean) / std
-    X_test_scaled = (X_test_raw - mean) / std
-    
-    # 4. Create PyTorch DataLoaders
-    train_dataset = TrendTabularDataset(X_train_scaled, y_train)
-    val_dataset = TrendTabularDataset(X_val_scaled, y_val)
-    test_dataset = TrendTabularDataset(X_test_scaled, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    
-    input_dim = X_train_scaled.shape[1]
-    print(f"Tabular Input Dimension n (W={W}): {input_dim} features (4 x {input_dim//4} measures).")
-    
-    # 5. Experiments implementing Professor Tronci's guidance for W=60
-    experiments = [
-        {
-            "name": f"DirectLinearFFNN_n_to_1_W{W}",
-            "type": "direct_linear"
-        },
-        {
-            "name": f"Small3LayerFFNN_n_n10_3_1_W{W}",
-            "type": "small_3layer"
-        },
-        {
-            "name": f"Micro2LayerFFNN_n_n10_1_W{W}",
-            "type": "micro_2layer"
-        }
-    ]
-    
-    results = []
-    val_histories = {}
-    
-    for exp in experiments:
-        name = exp["name"]
-        print(f"\nConfiguring Experiment: {name}...")
+    for ds_entry in DATASET_FILES:
+        ds_name = ds_entry["name"]
+        ds_file = ds_entry["file"]
+        W = ds_entry["W"]
+        is_capped = ds_entry["capped"]
         
-        if exp["type"] == "direct_linear":
-            model = DirectLinearFFNN(input_dim=input_dim).to(device)
-        elif exp["type"] == "small_3layer":
-            model = Small3LayerFFNN(input_dim=input_dim, dropout_rate=0.10).to(device)
-        elif exp["type"] == "micro_2layer":
-            model = Micro2LayerFFNN(input_dim=input_dim, dropout_rate=0.10).to(device)
+        file_path = find_dataset_file(DATASETS_DIR, ds_file)
+        if not os.path.exists(file_path):
+            print(f"[SKIP] File not found: {file_path}. Proceeding to next.")
+            continue
             
-        val_mae_hist, train_mape, train_mae, val_mape, val_mae, test_mape, test_mae = train_and_evaluate_ffnn(
-            model, train_loader, val_loader, test_loader, exp, name, device
-        )
+        cap_str = f"Capped at {TTE_CAP_DAYS}d" if is_capped else "Uncapped"
+        print(f"\n{'='*90}\n DATASET: {ds_name} | Window: W={W} | Mode: {cap_str}\n{'='*90}")
+        df, pid_col = load_dataset(file_path)
+        X_raw, y_log, y_days, pid_all, time_all = prepare_raw_data(df, pid_col)
         
-        val_histories[name] = val_mae_hist
-        results.append({
-            "Architecture / Pipeline": name,
-            "Train MAE (days)": round(train_mae, 2),
-            "Val MAE (days)": round(val_mae, 2),
-            "Test MAE (days)": round(test_mae, 2),
-            "Train MAPE (%)": round(train_mape, 2),
-            "Val MAPE (%)": round(val_mape, 2),
-            "Test MAPE (%)": round(test_mape, 2)
-        })
+        for split_mode in SPLIT_MODES:
+            print(f"\n>>> Split Mode: {split_mode.upper()} <<<")
+            train_mask, val_mask, test_mask = create_split_masks(pid_all, time_all, split_mode=split_mode)
+            
+            # Extract 4 features per measure: a, b, c, z -> N = 4 * M
+            X_tr, y_tr_log, y_tr_d = extract_features(X_raw, y_log, y_days, pid_all, train_mask, W)
+            X_va, y_va_log, y_va_d = extract_features(X_raw, y_log, y_days, pid_all, val_mask, W)
+            X_te, y_te_log, y_te_d = extract_features(X_raw, y_log, y_days, pid_all, test_mask, W)
+            
+            if len(X_tr) == 0 or len(X_va) == 0 or len(X_te) == 0:
+                print(f"[SKIP] Insufficient samples for split {split_mode}.")
+                continue
+                
+            mean = X_tr.mean(axis=0, keepdims=True)
+            std = X_tr.std(axis=0, keepdims=True)
+            std[std == 0] = 1.0
+            
+            X_tr_s = (X_tr - mean) / std
+            X_va_s = (X_va - mean) / std
+            X_te_s = (X_te - mean) / std
+            
+            train_loader = DataLoader(TabularLogDataset(X_tr_s, y_tr_log, y_tr_d), batch_size=BATCH_SIZE, shuffle=True)
+            val_loader = DataLoader(TabularLogDataset(X_va_s, y_va_log, y_va_d), batch_size=BATCH_SIZE, shuffle=False)
+            test_loader = DataLoader(TabularLogDataset(X_te_s, y_te_log, y_te_d), batch_size=BATCH_SIZE, shuffle=False)
+            
+            N = X_tr_s.shape[1]
+            M_meas = N // 4
+            print(f"Verified Input Layer Dimension: N = 4 x {M_meas} = {N} features.")
+            
+            # Hidden units progression: explicitly includes 1, 2, 3 and scales up to N
+            base_steps = [1, 2, 3, 5, 8, 16, 32, 64, 128]
+            candidate_H = sorted(list(set([h for h in base_steps if h < N] + [N])))
+            
+            print(f"Hidden node search progression H: {candidate_H}")
+            
+            arch_history = []
+            
+            for h in candidate_H:
+                model = SystematicFFNN(input_dim=N, hidden_dim=h).to(device)
+                num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                
+                tr_mae, tr_mape, va_mae, va_mape, te_mae, te_mape = train_model(
+                    model, train_loader, val_loader, test_loader, device, is_capped=is_capped
+                )
+                
+                diff_tr_te = abs(tr_mae - te_mae)
+                
+                res_entry = {
+                    "Dataset": ds_name,
+                    "Measures": M_meas,
+                    "Capped": is_capped,
+                    "Split": split_mode,
+                    "Window_W": W,
+                    "N_inputs": N,
+                    "Hidden_H": h,
+                    "Parameters": num_params,
+                    "Train_MAE_days": round(tr_mae, 2),
+                    "Val_MAE_days": round(va_mae, 2),
+                    "Test_MAE_days": round(te_mae, 2),
+                    "Diff_Train_Test": round(diff_tr_te, 2),
+                    "Test_MAPE": round(te_mape, 2)
+                }
+                all_results.append(res_entry)
+                arch_history.append({"H": h, "train_mae": tr_mae, "val_mae": va_mae, "test_mae": te_mae})
+                
+                print(f"  [H = {h:3d}] ({num_params:5d} params) -> Train MAE: {tr_mae:6.2f}d | Val MAE: {va_mae:6.2f}d | "
+                      f"Test MAE: {te_mae:6.2f}d | |Train-Test| Gap: {diff_tr_te:5.2f}d | Test MAPE: {te_mape:5.1f}%")
+                
+                # Check for architectural pruning
+                should_prune, reason = check_architectural_pruning(arch_history)
+                if should_prune:
+                    print(f"     ==> [PRUNING TRIGGERED] H expansion stopped for {ds_name} ({split_mode}). Reason: {reason}")
+                    break
+
+    # --- 8. Export and Display Comparative Summary ---
+    df_results = pd.DataFrame(all_results)
+    out_csv = os.path.join(BASE_DIR, "final_systematic_ffnn_log_tte_results.csv")
+    df_results.to_csv(out_csv, index=False)
+    print(f"\n{'='*100}\nSYSTEMATIC EXPLORATION COMPLETE! Results saved to:\n{out_csv}\n{'='*100}")
+    
+    if not df_results.empty:
+        # Table 1: Best Ergodic Alignment
+        print("\nTOP CONFIGURATIONS BY ERGODIC CONVERGENCE (|Train MAE - Test MAE|):")
+        best_ergodic = df_results.sort_values(by="Diff_Train_Test").head(15)
+        print(best_ergodic[["Dataset", "Measures", "Split", "Window_W", "Hidden_H", "Parameters", "Train_MAE_days", "Test_MAE_days", "Diff_Train_Test"]].to_string(index=False))
         
-    # --- GENERATE FINAL TABLE ---
-    df_results = pd.DataFrame(results)
-    
-    print("\n" + "="*110)
-    print(f" FINAL PERFORMANCE EVALUATION TABLE (SMALL FFNN MODELS, W = {W})")
-    print("="*110)
-    print(df_results.to_string(index=False))
-    print("="*110)
-    
-    # Save table to CSV
-    csv_out_path = os.path.join(CACHE_DIR, f"final_test_performance_ffnn_small_W{W}.csv")
-    df_results.to_csv(csv_out_path, index=False)
-    print(f"\nResults table saved to CSV: {csv_out_path}")
-    
-    # --- PLOT 1: FINAL TEST MAE BAR CHART ---
-    plt.figure(figsize=(10, 6))
-    bars = plt.bar(df_results["Architecture / Pipeline"], df_results["Test MAE (days)"], color=['#2b5c8f', '#d95f02', '#7570b3'])
-    plt.title(f"Final Test MAE Evaluation in Days (Small FFNNs, W = {W})", fontsize=13, fontweight='bold')
-    plt.ylabel("Mean Absolute Error (MAE) in Days", fontsize=11)
-    plt.xticks(rotation=15, ha="right")
-    
-    max_mae = df_results["Test MAE (days)"].max()
-    plt.ylim(0, max_mae * 1.15)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    
-    for bar in bars:
-        yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2.0, yval + (max_mae * 0.02), f"{yval:.2f}d", ha='center', va='bottom', fontweight='bold')
-        
-    plt.subplots_adjust(bottom=0.25, top=0.90)
-    bar_plot_path = os.path.join(CACHE_DIR, f"final_test_mae_ffnn_small_W{W}.png")
-    plt.savefig(bar_plot_path, bbox_inches='tight')
-    print(f"Performance bar chart saved to: {bar_plot_path}")
-    
-    # --- PLOT 2: VALIDATION LEARNING CURVES ---
-    plt.figure(figsize=(10, 6))
-    for name, hist in val_histories.items():
-        plt.plot(range(1, len(hist) + 1), hist, label=f"{name}")
-        
-    plt.title(f"Validation MAE Curves per Epoch in Days (Small FFNNs, W = {W})", fontsize=13)
-    plt.xlabel("Epoch", fontsize=11)
-    plt.ylabel("Validation MAE (Days)", fontsize=11)
-    plt.legend()
-    plt.grid(True, ls="--")
-    plt.tight_layout()
-    curve_plot_path = os.path.join(CACHE_DIR, f"val_mae_learning_curves_ffnn_small_W{W}.png")
-    plt.savefig(curve_plot_path)
-    print(f"Validation learning curves plot saved to: {curve_plot_path}")
+        # Table 2: Best Test Performance
+        print("\nTOP CONFIGURATIONS BY LOWEST TEST MAE (Days):")
+        best_test = df_results.sort_values(by="Test_MAE_days").head(15)
+        print(best_test[["Dataset", "Measures", "Split", "Window_W", "Hidden_H", "Parameters", "Train_MAE_days", "Test_MAE_days", "Diff_Train_Test"]].to_string(index=False))
+
 
 if __name__ == "__main__":
     main()
