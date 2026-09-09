@@ -31,9 +31,9 @@ WEIGHT_DECAY = 2e-2
 EARLY_STOPPING_PATIENCE = 40
 TTE_CAP_DAYS = 360.0
 
-# Clinical Triage & KM Evaluation Cut-offs (Updated to 360d)
+# Clinical Triage & KM Evaluation Cut-offs (Inclusive >= 360 for Green)
 T_RED = 180.0
-T_GREEN = 360.0  # Threshold aligned with the 360-day cap
+T_GREEN = 360.0
 KM_EVAL_RED = 180.0
 KM_EVAL_GREEN = 360.0
 
@@ -46,7 +46,7 @@ class SystematicFFNN(nn.Module):
         self.hidden_dim = hidden_dim
         
         # When hidden_dim == 1, LayerNorm across dimension 1 would zero out outputs.
-        # LayerNorm is therefore applied only when hidden_dim > 1.
+        # LayerNorm is applied only when hidden_dim > 1.
         if hidden_dim == 1:
             self.net = nn.Sequential(
                 nn.Linear(input_dim, 1),
@@ -92,7 +92,6 @@ def load_dataset(file_path):
     df = pd.read_csv(file_path)
     print(f"Loaded {len(df)} rows and {len(df.columns)} columns in {time.time() - t0:.2f}s.")
     
-    # Dynamically resolve patient ID column spelling
     pid_col = 'partient_id' if 'partient_id' in df.columns else 'patient_id'
     if 'timestamp' in df.columns:
         df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -107,7 +106,6 @@ def prepare_raw_data(df, pid_col):
     time_all = df['timestamp'].values if 'timestamp' in df.columns else np.arange(len(df))
     y_raw_days = df['tte'].values.astype(np.float32)
     
-    # Target: use log_tte directly from column if present, otherwise compute log(1 + TTE)
     if 'log_tte' in df.columns:
         y_log = df['log_tte'].values.astype(np.float32)
     else:
@@ -128,7 +126,6 @@ def create_split_masks(pid_all, time_all, split_mode="patient_wise", train_ratio
     unique_pids = np.unique(pid_all)
     
     if split_mode == "patient_wise":
-        # Disjoint patient split
         n_pids = len(unique_pids)
         rng = np.random.RandomState(42)
         shuffled_pids = rng.permutation(unique_pids)
@@ -149,7 +146,6 @@ def create_split_masks(pid_all, time_all, split_mode="patient_wise", train_ratio
                 test_mask[idx] = True
                 
     elif split_mode == "temporal":
-        # Chronological split per patient
         for pid in unique_pids:
             p_indices = np.where(pid_all == pid)[0]
             n_p = len(p_indices)
@@ -213,7 +209,7 @@ class TabularLogDataset(Dataset):
         return self.X[idx], self.y_log[idx], self.y_days[idx]
 
 
-# --- 5. Model Evaluation and Training Loop with Early Stopping ---
+# --- 5. Model Evaluation and Training Loop ---
 def evaluate_model(model, data_loader, device, is_capped):
     model.eval()
     all_preds_days = []
@@ -345,19 +341,18 @@ def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred, is_capped=True):
     y_test_true = np.asarray(y_test_true, dtype=np.float32)
     y_test_pred = np.asarray(y_test_pred, dtype=np.float32)
     
-    # Clinical Triage Classification (Threshold updated to 360d with inclusive >= for Green)
+    # Clinical Triage: Green defined as TTE >= 360d for ALL datasets (including capped)
     mask_red = y_test_pred < T_RED
     mask_yellow = (y_test_pred >= T_RED) & (y_test_pred < T_GREEN)
     mask_green = y_test_pred >= T_GREEN
     
-    # In capped datasets, samples with true TTE >= 360.0 are administratively censored (event = 0)
-    # because they reached the 1-year endpoint without vascular failure.
+    # In capped datasets, samples with true TTE >= 360d are administratively censored at day 360
     if is_capped:
         events = (y_test_true < TTE_CAP_DAYS).astype(int)
     else:
         events = np.ones_like(y_test_true, dtype=int)
     
-    # 1. KM Curve for Red Class (High Risk) -> Objective: Minimize P_R at 180d
+    # 1. Red Class (High Risk) -> Minimize P_R at 180d
     if np.sum(mask_red) > 0:
         t_r, s_r = compute_kaplan_meier_curve(y_test_true[mask_red], events[mask_red])
         p_r = get_survival_probability_at_time(t_r, s_r, KM_EVAL_RED)
@@ -365,7 +360,7 @@ def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred, is_capped=True):
         t_r, s_r = np.array([0.0, KM_EVAL_RED]), np.array([1.0, 1.0])
         p_r = 1.0
         
-    # 2. KM Curve for Green Class (Low Risk) -> Objective: Maximize P_G at 360d
+    # 2. Green Class (Low Risk) -> Maximize P_G at 360d
     if np.sum(mask_green) > 0:
         t_g, s_g = compute_kaplan_meier_curve(y_test_true[mask_green], events[mask_green])
         p_g = get_survival_probability_at_time(t_g, s_g, KM_EVAL_GREEN)
@@ -373,13 +368,13 @@ def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred, is_capped=True):
         t_g, s_g = np.array([0.0, KM_EVAL_GREEN]), np.array([0.0, 0.0])
         p_g = 0.0
         
-    # 3. KM Curve for Yellow Class (Medium Risk)
+    # 3. Yellow Class (Medium Risk)
     if np.sum(mask_yellow) > 0:
         t_y, s_y = compute_kaplan_meier_curve(y_test_true[mask_yellow], events[mask_yellow])
     else:
         t_y, s_y = np.array([0.0]), np.array([1.0])
         
-    p_bar_g = 1.0 - p_g  # Objective: Minimize alongside P_R
+    p_bar_g = 1.0 - p_g
     
     return {
         "P_R": round(p_r, 4),
@@ -404,7 +399,7 @@ def compute_pareto_mask(p_bar_g_arr, p_r_arr):
     for i in range(n):
         for j in range(n):
             if i != j:
-                # Point j dominates point i if <= on both objectives and < on at least one
+                # Point j dominates point i if <= on both and < on at least one
                 if (pts[j, 0] <= pts[i, 0] and pts[j, 1] <= pts[i, 1]) and \
                    (pts[j, 0] < pts[i, 0] or pts[j, 1] < pts[i, 1]):
                     is_pareto[i] = False
@@ -412,7 +407,7 @@ def compute_pareto_mask(p_bar_g_arr, p_r_arr):
     return is_pareto
 
 
-# --- 9. Automated Plotting Functions (KM Curves & Pareto Frontier) ---
+# --- 9. Automated Plotting Functions ---
 def plot_kaplan_meier_curves(km_data, title, save_path):
     plt.figure(figsize=(9, 5.5))
     
@@ -451,7 +446,7 @@ def plot_kaplan_meier_curves(km_data, title, save_path):
     plt.close()
 
 
-def plot_pareto_frontier(df_pareto, title, save_path):
+def plot_scenario_pareto_frontier(df_pareto, title, save_path):
     if df_pareto.empty:
         return
         
@@ -463,22 +458,17 @@ def plot_pareto_frontier(df_pareto, title, save_path):
     dominated_pts = df_pareto[~df_pareto["is_pareto"]]
     
     plt.figure(figsize=(8, 6.5))
-    
-    # Dominated models
     if not dominated_pts.empty:
         plt.scatter(dominated_pts["P_bar_G"], dominated_pts["P_R"], color="#7f7f7f", alpha=0.6, s=60, label="Dominated Models")
         for _, r in dominated_pts.iterrows():
             plt.annotate(f"H={int(r['Hidden_H'])}", (r["P_bar_G"], r["P_R"]), textcoords="offset points", xytext=(4, 4), fontsize=8, color="#555555")
             
-    # Non-dominated models (Pareto Frontier)
     plt.scatter(pareto_pts["P_bar_G"], pareto_pts["P_R"], color="#d62728", s=110, zorder=5, label="Pareto Frontier (Non-Dominated)")
     plt.plot(pareto_pts["P_bar_G"], pareto_pts["P_R"], color="#d62728", linestyle="-", linewidth=2.0, zorder=4)
     for _, r in pareto_pts.iterrows():
         plt.annotate(f"H={int(r['Hidden_H'])}\n({r['Parameters']}p)", (r["P_bar_G"], r["P_R"]), textcoords="offset points", xytext=(6, -6), fontsize=9, fontweight="bold", color="#d62728")
         
-    # Ideal utopia point
     plt.scatter([0], [0], color="#1f77b4", marker="*", s=160, zorder=6, label="Ideal Point (0, 0)")
-    
     plt.xlabel(r"$\bar{P}_G = 1 - P_G$ (Minimize $\to 0$)", fontsize=11)
     plt.ylabel(r"$P_R$ (Minimize $\to 0$)", fontsize=11)
     plt.title(title, fontsize=12, fontweight="bold")
@@ -491,16 +481,74 @@ def plot_pareto_frontier(df_pareto, title, save_path):
     plt.close()
 
 
+def plot_global_pareto_frontier_numbered(df_all, title, save_path):
+    """
+    Plots the Global Pareto Frontier with sequential numbered tags (KM 1, KM 2, ...)
+    matching the individually generated Kaplan-Meier curve plots.
+    """
+    pts = df_all[["P_bar_G", "P_R"]].values
+    is_pareto = compute_pareto_mask(pts[:, 0], pts[:, 1])
+    df_all["is_pareto"] = is_pareto
+    
+    pareto_pts = df_all[df_all["is_pareto"]].sort_values(by="P_bar_G").reset_index(drop=True)
+    dominated_pts = df_all[~df_all["is_pareto"]]
+    
+    plt.figure(figsize=(9.5, 7.5))
+    
+    # Dominated models (gray scatter)
+    if not dominated_pts.empty:
+        plt.scatter(dominated_pts["P_bar_G"], dominated_pts["P_R"], color="#a0a0a0", alpha=0.5, s=50, label="Dominated Models")
+        
+    # Non-dominated models (red scatter & connecting line)
+    plt.plot(pareto_pts["P_bar_G"], pareto_pts["P_R"], color="#d62728", linestyle="-", linewidth=2.2, zorder=4)
+    plt.scatter(pareto_pts["P_bar_G"], pareto_pts["P_R"], color="#d62728", s=130, zorder=5, label="Pareto Frontier (Non-Dominated)")
+    
+    # Add numbered badges (KM 1, KM 2, ...) matching the KM plots
+    for idx, r in pareto_pts.iterrows():
+        km_num = idx + 1
+        label_text = f"KM {km_num}"
+        
+        # Staggered annotation offsets to prevent label collision
+        offset_y = 12 if idx % 2 == 0 else -20
+        offset_x = 10 if r["P_bar_G"] < 0.8 else -45
+        
+        plt.annotate(
+            label_text,
+            (r["P_bar_G"], r["P_R"]),
+            textcoords="offset points",
+            xytext=(offset_x, offset_y),
+            fontsize=10,
+            fontweight="bold",
+            color="#b30000",
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#d62728", lw=1.2, alpha=0.9),
+            arrowprops=dict(arrowstyle="->", color="#d62728", lw=1.0)
+        )
+        
+    # Ideal utopia point (0, 0)
+    plt.scatter([0], [0], color="#1f77b4", marker="*", s=220, zorder=6, label="Ideal Point (0, 0)")
+    
+    plt.xlabel(r"$\bar{P}_G = 1 - P_G$ (Minimize $\to 0$)", fontsize=12, fontweight="bold")
+    plt.ylabel(r"$P_R$ (Minimize $\to 0$)", fontsize=12, fontweight="bold")
+    plt.title(title, fontsize=13, fontweight="bold")
+    plt.xlim(-0.04, 1.06)
+    plt.ylim(-0.04, 1.06)
+    plt.grid(True, linestyle=":", alpha=0.6)
+    plt.legend(loc="upper right", frameon=True, fontsize=10)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+
+
 # --- 10. Main Execution Pipeline ---
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n=========================================================================")
-    print(f" COMPLETE PIPELINE: FFNN GRID SEARCH + TRIAGE + KM + PARETO FRONTIER")
+    print(f" COMPLETE PIPELINE: FFNN GRID SEARCH + TRIAGE + NUMBERED KM & PARETO")
     print(f" COMPUTATION DEVICE: {device}")
     print(f"=========================================================================\n")
     
     all_results = []
-    best_models_km = {}
+    all_km_cache = {}  # Caches triage KM curve data for every evaluated model
     
     for ds_entry in DATASET_FILES:
         ds_name = ds_entry["name"]
@@ -558,8 +606,12 @@ def main():
                     model, train_loader, val_loader, test_loader, device, is_capped=is_capped
                 )
                 
-                # Clinical Triage and Kaplan-Meier evaluation on the real Test Set (is_capped passed)
+                # Clinical Triage and Kaplan-Meier evaluation
                 triage_metrics = evaluate_triage_and_kaplan_meier(test_true, test_preds, is_capped=is_capped)
+                
+                # Cache the KM curves for this model
+                model_cache_key = f"{ds_name}_{split_mode}_H{h}"
+                all_km_cache[model_cache_key] = triage_metrics
                 
                 diff_tr_te = abs(tr_mae - te_mae)
                 
@@ -592,53 +644,67 @@ def main():
                       f"P_R (180d): {triage_metrics['P_R']:.2f} | P_G (360d): {triage_metrics['P_G']:.2f} | P_bar_G: {triage_metrics['P_bar_G']:.2f} | "
                       f"Counts (R/Y/G): {triage_metrics['N_Red']}/{triage_metrics['N_Yellow']}/{triage_metrics['N_Green']}")
                 
-                # Cache KM data for the best configuration (lowest Test MAE) in this scenario
-                key_model = f"{ds_name}_{split_mode}"
-                if key_model not in best_models_km or te_mae < best_models_km[key_model]["Test_MAE"]:
-                    best_models_km[key_model] = {
-                        "H": h,
-                        "Test_MAE": te_mae,
-                        "km_data": triage_metrics,
-                        "title": f"Kaplan-Meier Triage Curves - {ds_name} ({split_mode}, H={h})"
-                    }
-                    
                 should_prune, reason = check_architectural_pruning(arch_history)
                 if should_prune:
                     print(f"     ==> [PRUNING] Stopped H expansion for {ds_name} ({split_mode}). Reason: {reason}")
                     break
                     
-            # Generate Pareto Frontier for the individual scenario (Dataset + Split)
+            # Generate individual scenario Pareto plot
             df_scenario = pd.DataFrame(dataset_split_results)
             pareto_filename = os.path.join(PLOTS_DIR, f"pareto_{ds_name}_{split_mode}.png")
-            plot_pareto_frontier(df_scenario, f"Pareto Frontier: {ds_name} ({split_mode})", pareto_filename)
+            plot_scenario_pareto_frontier(df_scenario, f"Pareto Frontier: {ds_name} ({split_mode})", pareto_filename)
 
-    # --- 11. Generate KM Plots for Best Models ---
-    print(f"\n{'='*90}\n GENERATING KAPLAN-MEIER PLOTS AND GLOBAL PARETO FRONTIER\n{'='*90}")
-    for key_model, info in best_models_km.items():
-        km_filename = os.path.join(PLOTS_DIR, f"km_curve_{key_model}_H{info['H']}.png")
-        plot_kaplan_meier_curves(info["km_data"], info["title"], km_filename)
-        print(f"Saved KM plot: {km_filename}")
-
-    # --- 12. Global Pareto Frontier & Final CSV Export ---
+    # --- 11. Global Pareto Optimization and KM Plot Numbering ---
     df_all = pd.DataFrame(all_results)
     if not df_all.empty:
+        # Compute global non-dominated Pareto mask
         df_all["is_pareto"] = compute_pareto_mask(df_all["P_bar_G"].values, df_all["P_R"].values)
         
-        global_pareto_file = os.path.join(PLOTS_DIR, "pareto_frontier_global.png")
-        plot_pareto_frontier(df_all, "Global Pareto Frontier (All Models)", global_pareto_file)
-        print(f"Saved Global Pareto Frontier plot: {global_pareto_file}")
+        # Sort Pareto optimal models along the frontier by P_bar_G
+        pareto_indices = df_all[df_all["is_pareto"]].sort_values(by="P_bar_G").index
+        df_all["Pareto_ID"] = "-"
         
+        print(f"\n{'='*100}\n GENERATING NUMBERED KAPLAN-MEIER CURVES FOR PARETO OPTIMAL MODELS\n{'='*100}")
+        
+        # Assign sequential ID (KM 1, KM 2, ...) and plot corresponding KM curves
+        for idx, orig_idx in enumerate(pareto_indices):
+            km_num = idx + 1
+            km_id_tag = f"KM {km_num}"
+            df_all.loc[orig_idx, "Pareto_ID"] = km_id_tag
+            
+            row = df_all.loc[orig_idx]
+            ds = row["Dataset"]
+            sp = row["Split"]
+            h = int(row["Hidden_H"])
+            
+            model_key = f"{ds}_{sp}_H{h}"
+            if model_key in all_km_cache:
+                km_data = all_km_cache[model_key]
+                km_title = f"[{km_id_tag}] Kaplan-Meier Triage - {ds} ({sp}, H={h})"
+                km_filename = os.path.join(PLOTS_DIR, f"KM_{km_num}_{ds}_{sp}_H{h}.png")
+                plot_kaplan_meier_curves(km_data, km_title, km_filename)
+                print(f"  --> Saved [{km_id_tag}]: {km_filename}")
+                
+        # Generate Global Pareto Frontier with matching numbered badges
+        global_pareto_file = os.path.join(PLOTS_DIR, "pareto_frontier_global_numbered.png")
+        plot_global_pareto_frontier_numbered(df_all, "Global Pareto Frontier with Numbered KM Curves", global_pareto_file)
+        print(f"\nSaved Numbered Global Pareto Frontier: {global_pareto_file}")
+        
+        # Save complete results to CSV
         out_csv = os.path.join(BASE_DIR, "final_systematic_ffnn_triage_pareto_results.csv")
         df_all.to_csv(out_csv, index=False)
-        print(f"Full results exported to: {out_csv}")
+        print(f"Results exported with Pareto_ID to: {out_csv}")
         
-        # Display optimal non-dominated models
-        pareto_models = df_all[df_all["is_pareto"]].sort_values(by="P_bar_G")
-        print("\n" + "="*110)
-        print(" OPTIMAL NON-DOMINATED MODELS ON THE PARETO FRONTIER (P_R vs P_bar_G)")
-        print("="*110)
-        print(pareto_models[["Dataset", "Split", "Window_W", "Hidden_H", "Parameters", "Test_MAE_days", "P_R", "P_G", "P_bar_G", "N_Red", "N_Yellow", "N_Green"]].to_string(index=False))
-        print("="*110)
+        # Display the numbered Pareto table
+        pareto_table = df_all[df_all["is_pareto"]].sort_values(by="P_bar_G")
+        print("\n" + "="*120)
+        print(" NUMBERED PARETO OPTIMAL MODELS (KM 1 - KM K) MAPPED TO THE GLOBAL FRONTIER")
+        print("="*120)
+        disp_cols = ["Pareto_ID", "Dataset", "Split", "Window_W", "Hidden_H", "Parameters", 
+                     "Test_MAE_days", "P_R", "P_G", "P_bar_G", "N_Red", "N_Green"]
+        print(pareto_table[disp_cols].to_string(index=False))
+        print("="*120)
+
 
 if __name__ == "__main__":
     main()
