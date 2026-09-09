@@ -31,21 +31,15 @@ WEIGHT_DECAY = 2e-2
 EARLY_STOPPING_PATIENCE = 40
 TTE_CAP_DAYS = 360.0
 
-# Clinical Triage & KM Evaluation Cut-offs
+# Clinical Triage & KM Evaluation Cut-offs (Updated to 360d)
 T_RED = 180.0
-T_GREEN = 365.0
+T_GREEN = 360.0  # Threshold aligned with the 360-day cap
 KM_EVAL_RED = 180.0
 KM_EVAL_GREEN = 360.0
 
 
 # --- 2. Scalable Feed-Forward Architecture (N -> H -> 1) ---
 class SystematicFFNN(nn.Module):
-    """
-    Feed-Forward Neural Network:
-    - Input dimension: N = 4 * M (slope a, intercept b, RMSE c, current value z)
-    - Hidden dimension: H (dynamically explored from 1, 2, 3 up to N)
-    - Output dimension: 1 (predicts log(TTE))
-    """
     def __init__(self, input_dim, hidden_dim, dropout_rate=0.20, noise_std=0.03):
         super().__init__()
         self.noise_std = noise_std
@@ -170,12 +164,6 @@ def create_split_masks(pid_all, time_all, split_mode="patient_wise", train_ratio
 
 
 def extract_features(X_all, y_log, y_days, pid_all, target_mask, W):
-    """
-    Extracts features for the specified partition:
-    - If already pre-extracted (104 or 176 features), selects valid rows directly.
-    - If raw measures (26 or 44), computes the linear regression trend over window W.
-      Features extracted per measure: a (slope), b (intercept), c (RMSE), z (current value).
-    """
     M_raw = X_all.shape[1]
     if M_raw in [104, 176]:
         valid_indices = np.where(target_mask)[0]
@@ -235,7 +223,7 @@ def evaluate_model(model, data_loader, device, is_capped):
         for X_b, _, y_days_b in data_loader:
             X_b = X_b.to(device)
             preds_log = model(X_b)
-            # Inverse log transform: exp(pred_log) guarantees strictly positive TTE
+            # Inversion: exp(pred_log) guarantees strictly positive TTE
             preds_days = torch.exp(preds_log)
             if is_capped:
                 preds_days = torch.clamp(preds_days, max=TTE_CAP_DAYS)
@@ -315,7 +303,7 @@ def check_architectural_pruning(history, max_patience=2, gap_threshold=35.0, gap
     return False, ""
 
 
-# --- 7. Kaplan-Meier and Clinical Triage Engine (Computed on Test Set) ---
+# --- 7. Kaplan-Meier and Clinical Triage Engine ---
 def compute_kaplan_meier_curve(durations, events=None):
     durations = np.asarray(durations, dtype=np.float64)
     if events is None:
@@ -353,18 +341,25 @@ def get_survival_probability_at_time(km_times, km_probs, target_time):
     return float(km_probs[idx])
 
 
-def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred):
+def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred, is_capped=True):
     y_test_true = np.asarray(y_test_true, dtype=np.float32)
     y_test_pred = np.asarray(y_test_pred, dtype=np.float32)
     
-    # Clinical Triage Classification based on predicted TTE
+    # Clinical Triage Classification (Threshold updated to 360d with inclusive >= for Green)
     mask_red = y_test_pred < T_RED
-    mask_yellow = (y_test_pred >= T_RED) & (y_test_pred <= T_GREEN)
-    mask_green = y_test_pred > T_GREEN
+    mask_yellow = (y_test_pred >= T_RED) & (y_test_pred < T_GREEN)
+    mask_green = y_test_pred >= T_GREEN
+    
+    # In capped datasets, samples with true TTE >= 360.0 are administratively censored (event = 0)
+    # because they reached the 1-year endpoint without vascular failure.
+    if is_capped:
+        events = (y_test_true < TTE_CAP_DAYS).astype(int)
+    else:
+        events = np.ones_like(y_test_true, dtype=int)
     
     # 1. KM Curve for Red Class (High Risk) -> Objective: Minimize P_R at 180d
     if np.sum(mask_red) > 0:
-        t_r, s_r = compute_kaplan_meier_curve(y_test_true[mask_red])
+        t_r, s_r = compute_kaplan_meier_curve(y_test_true[mask_red], events[mask_red])
         p_r = get_survival_probability_at_time(t_r, s_r, KM_EVAL_RED)
     else:
         t_r, s_r = np.array([0.0, KM_EVAL_RED]), np.array([1.0, 1.0])
@@ -372,7 +367,7 @@ def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred):
         
     # 2. KM Curve for Green Class (Low Risk) -> Objective: Maximize P_G at 360d
     if np.sum(mask_green) > 0:
-        t_g, s_g = compute_kaplan_meier_curve(y_test_true[mask_green])
+        t_g, s_g = compute_kaplan_meier_curve(y_test_true[mask_green], events[mask_green])
         p_g = get_survival_probability_at_time(t_g, s_g, KM_EVAL_GREEN)
     else:
         t_g, s_g = np.array([0.0, KM_EVAL_GREEN]), np.array([0.0, 0.0])
@@ -380,7 +375,7 @@ def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred):
         
     # 3. KM Curve for Yellow Class (Medium Risk)
     if np.sum(mask_yellow) > 0:
-        t_y, s_y = compute_kaplan_meier_curve(y_test_true[mask_yellow])
+        t_y, s_y = compute_kaplan_meier_curve(y_test_true[mask_yellow], events[mask_yellow])
     else:
         t_y, s_y = np.array([0.0]), np.array([1.0])
         
@@ -428,9 +423,9 @@ def plot_kaplan_meier_curves(km_data, title, save_path):
     p_r = km_data["P_R"]
     p_g = km_data["P_G"]
     
-    plt.step(t_g, s_g, label=f"Green (Pred > 365d, N={km_data['N_Green']})", color="#2ca02c", linewidth=2.5, where='post')
-    plt.step(t_y, s_y, label=f"Yellow (180-365d, N={km_data['N_Yellow']})", color="#ff7f0e", linewidth=2.0, where='post')
-    plt.step(t_r, s_r, label=f"Red (Pred < 180d, N={km_data['N_Red']})", color="#d62728", linewidth=2.5, where='post')
+    plt.step(t_g, s_g, label=f"Green (Pred >= {int(T_GREEN)}d, N={km_data['N_Green']})", color="#2ca02c", linewidth=2.5, where='post')
+    plt.step(t_y, s_y, label=f"Yellow ({int(T_RED)}-{int(T_GREEN)}d, N={km_data['N_Yellow']})", color="#ff7f0e", linewidth=2.0, where='post')
+    plt.step(t_r, s_r, label=f"Red (Pred < {int(T_RED)}d, N={km_data['N_Red']})", color="#d62728", linewidth=2.5, where='post')
     
     # Reference vertical lines at 180 and 360 days with arrows
     plt.axvline(x=KM_EVAL_RED, color="gray", linestyle="--", alpha=0.7)
@@ -563,8 +558,8 @@ def main():
                     model, train_loader, val_loader, test_loader, device, is_capped=is_capped
                 )
                 
-                # Clinical Triage and Kaplan-Meier evaluation on the real Test Set
-                triage_metrics = evaluate_triage_and_kaplan_meier(test_true, test_preds)
+                # Clinical Triage and Kaplan-Meier evaluation on the real Test Set (is_capped passed)
+                triage_metrics = evaluate_triage_and_kaplan_meier(test_true, test_preds, is_capped=is_capped)
                 
                 diff_tr_te = abs(tr_mae - te_mae)
                 
@@ -594,7 +589,8 @@ def main():
                 arch_history.append({"H": h, "train_mae": tr_mae, "val_mae": va_mae, "test_mae": te_mae})
                 
                 print(f"  [H = {h:3d}] ({num_params:5d} params) -> Train MAE: {tr_mae:5.2f}d | Val MAE: {va_mae:5.2f}d | Test MAE: {te_mae:5.2f}d | "
-                      f"P_R (180d): {triage_metrics['P_R']:.2f} | P_G (360d): {triage_metrics['P_G']:.2f} | P_bar_G: {triage_metrics['P_bar_G']:.2f}")
+                      f"P_R (180d): {triage_metrics['P_R']:.2f} | P_G (360d): {triage_metrics['P_G']:.2f} | P_bar_G: {triage_metrics['P_bar_G']:.2f} | "
+                      f"Counts (R/Y/G): {triage_metrics['N_Red']}/{triage_metrics['N_Yellow']}/{triage_metrics['N_Green']}")
                 
                 # Cache KM data for the best configuration (lowest Test MAE) in this scenario
                 key_model = f"{ds_name}_{split_mode}"
@@ -641,7 +637,7 @@ def main():
         print("\n" + "="*110)
         print(" OPTIMAL NON-DOMINATED MODELS ON THE PARETO FRONTIER (P_R vs P_bar_G)")
         print("="*110)
-        print(pareto_models[["Dataset", "Split", "Window_W", "Hidden_H", "Parameters", "Test_MAE_days", "P_R", "P_G", "P_bar_G"]].to_string(index=False))
+        print(pareto_models[["Dataset", "Split", "Window_W", "Hidden_H", "Parameters", "Test_MAE_days", "P_R", "P_G", "P_bar_G", "N_Red", "N_Yellow", "N_Green"]].to_string(index=False))
         print("="*110)
 
 if __name__ == "__main__":
