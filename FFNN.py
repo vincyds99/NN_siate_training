@@ -36,12 +36,19 @@ EARLY_STOPPING_PATIENCE = 40
 # Training cap updated to 400 days to prevent prediction boundary compression
 TTE_TRAIN_CAP_DAYS = 400.0
 
-# Clinical Triage cut-offs (Inclusive >= 360 for Green)
+# Clinical Triage cut-offs
 T_RED = 180.0
-T_GREEN = 360.0
+T_GREEN = 360.0  # Clinical 1-year threshold (>= 360d, covering > 365d)
 KM_EVAL_RED = 180.0
 KM_EVAL_GREEN = 360.0
-KM_MAX_DISPLAY_TIME = 500.0  # Extended KM x-axis display range (at least 500 days)
+
+# Option 2: Clinical Administrative Censoring Horizon (360.0 days)
+# Applied to both capped and uncapped datasets when an explicit event column is absent.
+# Patients completing the follow-up window without vascular failure exit the risk set (E=0).
+CENSORING_HORIZON_DAYS = 360.0
+
+# Extended KM x-axis display range (at least 500 days)
+KM_MAX_DISPLAY_TIME = 500.0
 
 # Minimum cohort size required in Red and Green classes for clinical validity in Pareto optimization
 MIN_TRIAGE_SAMPLES = 500
@@ -135,13 +142,14 @@ def prepare_raw_data(df, pid_col, is_capped):
             events_all = 1 - events_all
         print(f"[DATA LOADER] Detected event column '{event_col}': {np.sum(events_all==1)} events, {np.sum(events_all==0)} censored.")
     else:
-        if is_capped:
-            # Administrative censoring: reaching 360d without vascular failure is right-censored
-            events_all = (y_raw_days < 360.0).astype(np.int32)
-            print(f"[DATA LOADER] Applied administrative censoring at 360d: {np.sum(events_all==1)} events, {np.sum(events_all==0)} censored.")
-        else:
-            events_all = np.ones_like(y_raw_days, dtype=np.int32)
-            print("[DATA LOADER] Uncapped dataset without explicit event column. Defaulted events to 1.")
+        # Option 2: Administrative censoring at study horizon (360.0 days)
+        # Applied to both capped and uncapped datasets when explicit event column is absent.
+        # Patients completing the follow-up window without vascular failure exit the risk set (E=0),
+        # preventing artificial curve collapse and fixing the unnatural steep decline after day 360.
+        events_all = (y_raw_days < CENSORING_HORIZON_DAYS).astype(np.int32)
+        target_type = "Capped" if is_capped else "Uncapped"
+        print(f"[DATA LOADER] Option 2 applied to {target_type} dataset: administrative censoring at {CENSORING_HORIZON_DAYS}d -> "
+              f"{np.sum(events_all==1)} events, {np.sum(events_all==0)} censored.")
 
     # Parse feature array N = 4 * M
     all_str = ",".join(df['misure'].str.strip('{}'))
