@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import pandas as pd
 import numpy as np
@@ -7,15 +8,19 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
-# --- 1. Global Configurations and File Paths ---
+# =========================================================================
+# 1. Global Configurations and File Paths
+# =========================================================================
 BASE_DIR = r"c:\Users\vince\Desktop\NN"
-DATASETS_DIR = os.path.join(BASE_DIR, "datasets") if os.path.exists(os.path.join(BASE_DIR, "datasets")) else "datasets"
+DATASETS_DIR = os.path.join(BASE_DIR, "datasets") if os.path.exists(os.path.join(BASE_DIR, "datasets")) else (
+    os.path.join(BASE_DIR, "Datasets") if os.path.exists(os.path.join(BASE_DIR, "Datasets")) else "datasets"
+)
 PLOTS_DIR = os.path.join(BASE_DIR, "triage_pareto_plots")
 WEIGHTS_DIR = os.path.join(BASE_DIR, "models_weights")
 os.makedirs(PLOTS_DIR, exist_ok=True)
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
 
-# 6 dataset configurations with biological feature count M and window size W
+# 6 Systematic dataset configurations
 DATASET_FILES = [
     {"name": "44misure_capped360_W60", "file": "NN_training_dataset_W60_44_capped360", "W": 60, "M": 44, "capped": True},
     {"name": "26misure_capped360_W60", "file": "NN_training_dataset_W60_26_capped360", "W": 60, "M": 26, "capped": True},
@@ -25,7 +30,6 @@ DATASET_FILES = [
     {"name": "26misure_uncapped_W30",  "file": "NN_training_dataset_W30_26_uncapped",  "W": 30, "M": 26, "capped": False},
 ]
 
-# Standardized split naming
 SPLIT_MODES = ["split_patient", "split_temporal"]
 EPOCHS = 1000
 BATCH_SIZE = 128
@@ -33,36 +37,35 @@ LEARNING_RATE = 4e-4
 WEIGHT_DECAY = 2e-2
 EARLY_STOPPING_PATIENCE = 40
 
-# Training cap updated to 400 days to prevent prediction boundary compression
+# Network training saturation threshold (clamping in log-space)
 TTE_TRAIN_CAP_DAYS = 400.0
 
 # Clinical Triage cut-offs
 T_RED = 180.0
-T_GREEN = 360.0  # Clinical 1-year threshold (>= 360d, covering > 365d)
+T_GREEN = 360.0
 KM_EVAL_RED = 180.0
 KM_EVAL_GREEN = 360.0
 
-# Option 2: Clinical Administrative Censoring Horizon (360.0 days)
-# Applied to both capped and uncapped datasets when an explicit event column is absent.
-# Patients completing the follow-up window without vascular failure exit the risk set (E=0).
+# Scenario B: Clinical study follow-up threshold (360.0 days)
+# Sessions exceeding this observation window without recorded vascular failure are right-censored (E=0).
 CENSORING_HORIZON_DAYS = 360.0
 
-# Extended KM x-axis display range (at least 500 days)
-KM_MAX_DISPLAY_TIME = 500.0
+# Extended KM horizontal axis display range (at least 1000 days, extending dynamically up to 1500+ days)
+KM_MIN_DISPLAY_DAYS = 1000.0
 
-# Minimum cohort size required in Red and Green classes for clinical validity in Pareto optimization
+# Clinical cohort size threshold for Pareto validity filtering
 MIN_TRIAGE_SAMPLES = 500
 
 
-# --- 2. Scalable Feed-Forward Neural Network (N -> H -> 1) ---
+# =========================================================================
+# 2. Scalable Feed-Forward Neural Network (N -> H -> 1)
+# =========================================================================
 class SystematicFFNN(nn.Module):
     def __init__(self, input_dim, hidden_dim, dropout_rate=0.20, noise_std=0.03):
         super().__init__()
         self.noise_std = noise_std
         self.hidden_dim = hidden_dim
         
-        # When hidden_dim == 1, LayerNorm across dimension 1 zeroes out variance.
-        # LayerNorm is applied only when hidden_dim > 1.
         if hidden_dim == 1:
             self.net = nn.Sequential(
                 nn.Linear(input_dim, 1),
@@ -85,13 +88,74 @@ class SystematicFFNN(nn.Module):
         return self.net(x)
 
 
-# --- 3. Data Loading & Feature Extraction with Censoring Vector ---
+# =========================================================================
+# 3. Patient Age Metadata Loader & Raw Data Ingestion
+# =========================================================================
+def load_patient_age_map(datasets_dir):
+    """
+    Loads patient age metadata from patient_age.json in the Datasets directory.
+    Supports both dictionary mappings and lists of patient records.
+    """
+    candidates = [
+        os.path.join(datasets_dir, "patient_age.json"),
+        os.path.join(BASE_DIR, "Datasets", "patient_age.json"),
+        os.path.join(BASE_DIR, "datasets", "patient_age.json"),
+        os.path.join(BASE_DIR, "patient_age.json"),
+        os.path.join("Datasets", "patient_age.json"),
+        os.path.join("datasets", "patient_age.json"),
+        "patient_age.json",
+    ]
+    age_file = None
+    for c in candidates:
+        if os.path.exists(c):
+            age_file = c
+            break
+
+    if age_file is None:
+        print(f"[DATA LOADER] Warning: 'patient_age.json' not found in candidate paths.")
+        return {}
+
+    try:
+        with open(age_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        age_map = {}
+        if isinstance(data, dict):
+            for k, v in data.items():
+                try:
+                    age_val = float(v) if not isinstance(v, dict) else float(v.get('age', v.get('eta', np.nan)))
+                    age_map[str(k)] = age_val
+                    if str(k).isdigit():
+                        age_map[int(k)] = age_val
+                except (ValueError, TypeError):
+                    continue
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    pid = item.get('patient_id', item.get('partient_id', item.get('id', None)))
+                    age = item.get('age', item.get('eta', item.get('età', None)))
+                    if pid is not None and age is not None:
+                        try:
+                            age_val = float(age)
+                            age_map[str(pid)] = age_val
+                            if str(pid).isdigit():
+                                age_map[int(pid)] = age_val
+                        except (ValueError, TypeError):
+                            continue
+        print(f"[DATA LOADER] Loaded age metadata for {len(age_map) // 2} patients from: {age_file}")
+        return age_map
+    except Exception as e:
+        print(f"[DATA LOADER] Error reading {age_file}: {e}")
+        return {}
+
+
 def find_dataset_file(datasets_dir, base_name):
     candidates = [
         os.path.join(datasets_dir, base_name),
         os.path.join(datasets_dir, base_name + ".csv"),
         os.path.join(datasets_dir, base_name + ".CSV"),
-        os.path.join(BASE_DIR, base_name),
+        os.path.join(BASE_DIR, "Datasets", base_name + ".csv"),
+        os.path.join(BASE_DIR, "datasets", base_name + ".csv"),
         os.path.join(BASE_DIR, base_name + ".csv"),
         os.path.join(".", base_name),
         os.path.join(".", base_name + ".csv"),
@@ -106,7 +170,7 @@ def load_dataset(file_path):
     print(f"\n[DATA LOADER] Reading file: {file_path}")
     t0 = time.time()
     df = pd.read_csv(file_path)
-    print(f"Loaded {len(df)} rows in {time.time() - t0:.2f}s.")
+    print(f"Loaded {len(df)} sessions in {time.time() - t0:.2f}s.")
     
     pid_col = 'partient_id' if 'partient_id' in df.columns else 'patient_id'
     if 'timestamp' in df.columns:
@@ -117,21 +181,39 @@ def load_dataset(file_path):
     return df, pid_col
 
 
-def prepare_raw_data(df, pid_col, is_capped):
+def prepare_raw_data(df, pid_col, is_capped, age_map):
     pid_all = df[pid_col].values
     time_all = df['timestamp'].values if 'timestamp' in df.columns else np.arange(len(df))
     y_raw_days = df['tte'].values.astype(np.float32)
     
-    # Training target clipped to 400 days during training (raw data y_raw_days remain unchanged)
+    # Map patient ages from patient_age.json (or fallback to CSV columns if present)
+    age_col = None
+    for cand in ['age', 'eta', 'età', 'patient_age', 'eta_paziente', 'age_years', 'anni']:
+        if cand in df.columns:
+            age_col = cand
+            break
+            
+    if age_col is not None:
+        age_all = df[age_col].values.astype(np.float32)
+        print(f"[DATA LOADER] Extracted age from column '{age_col}' (Mean Age = {np.nanmean(age_all):.1f}y).")
+    elif age_map:
+        age_all = np.array([age_map.get(p, age_map.get(str(p), np.nan)) for p in pid_all], dtype=np.float32)
+        matched = np.sum(~np.isnan(age_all))
+        print(f"[DATA LOADER] Mapped age from patient_age.json for {matched}/{len(pid_all)} sessions (Mean Age = {np.nanmean(age_all):.1f}y).")
+    else:
+        age_all = np.full(len(df), np.nan, dtype=np.float32)
+        print("[DATA LOADER] Age metadata not available. Mean age columns will be populated as NaN.")
+
+    # Target definition for model training (capped at 400.0 days)
     if is_capped:
         y_train_days = np.clip(y_raw_days, 1.0, TTE_TRAIN_CAP_DAYS)
     else:
         y_train_days = np.maximum(y_raw_days, 1.0)
     y_log = np.log(y_train_days)
     
-    # Binary event vector (E=1 event occurred, E=0 right-censored)
+    # Check for explicit event column
     event_col = None
-    for cand in ['event', 'status', 'evento', 'failure', 'observed', 'censor', 'censored']:
+    for cand in ['event', 'status', 'evento', 'failure', 'observed', 'censor', 'censored', 'complicanza', 'occlusione']:
         if cand in df.columns:
             event_col = cand
             break
@@ -140,23 +222,26 @@ def prepare_raw_data(df, pid_col, is_capped):
         events_all = df[event_col].values.astype(np.int32)
         if 'censor' in event_col.lower():
             events_all = 1 - events_all
-        print(f"[DATA LOADER] Detected event column '{event_col}': {np.sum(events_all==1)} events, {np.sum(events_all==0)} censored.")
+        print(f"[DATA LOADER] Using explicit event column '{event_col}': {np.sum(events_all==1)} events, {np.sum(events_all==0)} censored.")
     else:
-        # Option 2: Administrative censoring at study horizon (360.0 days)
-        # Applied to both capped and uncapped datasets when explicit event column is absent.
-        # Patients completing the follow-up window without vascular failure exit the risk set (E=0),
-        # preventing artificial curve collapse and fixing the unnatural steep decline after day 360.
+        # Scenario B (Biostatistical Standard):
+        # In the absence of an explicitly documented adverse event, no event is assumed (E=0).
+        # Patients exiting the study upon follow-up completion, loss to follow-up, or withdrawal
+        # are right-censored at their last observed time.
+        # - TTE < 360.0 days represents confirmed early failure events (E=1).
+        # - TTE >= 360.0 days represents sessions completing the 1-year follow-up window without failure,
+        #   treated as right-censored (E=0).
         events_all = (y_raw_days < CENSORING_HORIZON_DAYS).astype(np.int32)
         target_type = "Capped" if is_capped else "Uncapped"
-        print(f"[DATA LOADER] Option 2 applied to {target_type} dataset: administrative censoring at {CENSORING_HORIZON_DAYS}d -> "
-              f"{np.sum(events_all==1)} events, {np.sum(events_all==0)} censored.")
+        print(f"[DATA LOADER] Scenario B applied to {target_type} dataset (Threshold = {CENSORING_HORIZON_DAYS}d): "
+              f"{np.sum(events_all==1)} events (E=1), {np.sum(events_all==0)} right-censored (E=0).")
 
     # Parse feature array N = 4 * M
     all_str = ",".join(df['misure'].str.strip('{}'))
     parsed = np.fromstring(all_str, sep=',', dtype=np.float32)
     X_raw = parsed.reshape(len(df), -1)
     
-    return X_raw, y_log, y_raw_days, events_all, pid_all, time_all
+    return X_raw, y_log, y_raw_days, events_all, age_all, pid_all, time_all
 
 
 def create_split_masks(pid_all, time_all, split_mode="split_temporal", train_ratio=0.5, val_ratio=0.1):
@@ -200,14 +285,19 @@ def create_split_masks(pid_all, time_all, split_mode="split_temporal", train_rat
     return train_mask, val_mask, test_mask
 
 
-def extract_features(X_all, y_log, y_days, events_all, pid_all, target_mask, W):
+def extract_features(X_all, y_log, y_days, events_all, age_all, pid_all, target_mask, W):
+    """
+    Computes linear regression features over temporal window W for each of the M measures:
+    slope (a), intercept (b), residual RMSE (c_rmse), and current measurement (z_curr).
+    """
     M_raw = X_all.shape[1]
     if M_raw in [104, 176]:
         valid_indices = np.where(target_mask)[0]
         return (X_all[valid_indices], 
                 y_log[valid_indices].reshape(-1, 1), 
                 y_days[valid_indices].reshape(-1, 1),
-                events_all[valid_indices].reshape(-1, 1))
+                events_all[valid_indices].reshape(-1, 1),
+                age_all[valid_indices].reshape(-1, 1))
         
     N_total = len(pid_all)
     pids_arr = np.array(pid_all)
@@ -218,8 +308,9 @@ def extract_features(X_all, y_log, y_days, events_all, pid_all, target_mask, W):
     if len(valid_indices) == 0:
         return (np.empty((0, 4 * M_raw), dtype=np.float32), 
                 np.empty((0, 1), dtype=np.float32), 
-                np.empty((0, 1), dtype=np.float32),
-                np.empty((0, 1), dtype=np.int32))
+                np.empty((0, 1), dtype=np.float32), 
+                np.empty((0, 1), dtype=np.int32),
+                np.empty((0, 1), dtype=np.float32))
 
     t = np.arange(W, dtype=np.float32)
     t_mean = (W - 1) / 2.0
@@ -242,33 +333,40 @@ def extract_features(X_all, y_log, y_days, events_all, pid_all, target_mask, W):
     return (X_features, 
             y_log[valid_indices].reshape(-1, 1), 
             y_days[valid_indices].reshape(-1, 1),
-            events_all[valid_indices].reshape(-1, 1))
+            events_all[valid_indices].reshape(-1, 1),
+            age_all[valid_indices].reshape(-1, 1))
 
 
-# --- 4. PyTorch Tabular Dataset with Censoring Vector ---
+# =========================================================================
+# 4. PyTorch Dataset with Censoring & Age Vectors
+# =========================================================================
 class TabularLogDataset(Dataset):
-    def __init__(self, X_tab, y_log, y_days, events):
+    def __init__(self, X_tab, y_log, y_days, events, ages):
         self.X = torch.tensor(X_tab, dtype=torch.float32)
         self.y_log = torch.tensor(y_log, dtype=torch.float32)
         self.y_days = torch.tensor(y_days, dtype=torch.float32)
         self.events = torch.tensor(events, dtype=torch.int32)
+        self.ages = torch.tensor(ages, dtype=torch.float32)
         
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y_log[idx], self.y_days[idx], self.events[idx]
+        return self.X[idx], self.y_log[idx], self.y_days[idx], self.events[idx], self.ages[idx]
 
 
-# --- 5. Model Evaluation and Training Loop ---
+# =========================================================================
+# 5. Model Evaluation and Training Pipeline
+# =========================================================================
 def evaluate_model(model, data_loader, device, is_capped):
     model.eval()
     all_preds_days = []
     all_true_days = []
     all_events = []
+    all_ages = []
     
     with torch.no_grad():
-        for X_b, _, y_days_b, events_b in data_loader:
+        for X_b, _, y_days_b, events_b, ages_b in data_loader:
             X_b = X_b.to(device)
             preds_log = model(X_b)
             preds_days = torch.exp(preds_log)
@@ -278,16 +376,18 @@ def evaluate_model(model, data_loader, device, is_capped):
             all_preds_days.append(preds_days.cpu().numpy().flatten())
             all_true_days.append(y_days_b.numpy().flatten())
             all_events.append(events_b.numpy().flatten())
+            all_ages.append(ages_b.numpy().flatten())
             
     all_preds = np.concatenate(all_preds_days)
     all_true = np.concatenate(all_true_days)
     all_events = np.concatenate(all_events)
+    all_ages = np.concatenate(all_ages)
     
     mae = np.mean(np.abs(all_preds - all_true))
     denom = np.clip(all_true, 10.0, None)
     mape = np.mean(np.abs(all_preds - all_true) / denom) * 100.0
     
-    return mae, mape, all_preds, all_true, all_events
+    return mae, mape, all_preds, all_true, all_events, all_ages
 
 
 def train_model(model, train_loader, val_loader, test_loader, device, is_capped, epochs=EPOCHS):
@@ -301,7 +401,7 @@ def train_model(model, train_loader, val_loader, test_loader, device, is_capped,
     
     for epoch in range(epochs):
         model.train()
-        for X_b, y_log_b, _, _ in train_loader:
+        for X_b, y_log_b, _, _, _ in train_loader:
             X_b, y_log_b = X_b.to(device), y_log_b.to(device)
             optimizer.zero_grad()
             out_log = model(X_b)
@@ -311,7 +411,7 @@ def train_model(model, train_loader, val_loader, test_loader, device, is_capped,
             optimizer.step()
             
         scheduler.step()
-        val_mae, _, _, _, _ = evaluate_model(model, val_loader, device, is_capped=is_capped)
+        val_mae, _, _, _, _, _ = evaluate_model(model, val_loader, device, is_capped=is_capped)
         if val_mae < best_val_mae:
             best_val_mae = val_mae
             best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -324,14 +424,16 @@ def train_model(model, train_loader, val_loader, test_loader, device, is_capped,
     if best_weights is not None:
         model.load_state_dict({k: v.to(device) for k, v in best_weights.items()})
         
-    tr_mae, tr_mape, _, _, _ = evaluate_model(model, train_loader, device, is_capped=is_capped)
-    va_mae, va_mape, _, _, _ = evaluate_model(model, val_loader, device, is_capped=is_capped)
-    te_mae, te_mape, test_preds, test_true, test_events = evaluate_model(model, test_loader, device, is_capped=is_capped)
+    tr_mae, tr_mape, _, _, _, _ = evaluate_model(model, train_loader, device, is_capped=is_capped)
+    va_mae, va_mape, _, _, _, _ = evaluate_model(model, val_loader, device, is_capped=is_capped)
+    te_mae, te_mape, test_preds, test_true, test_events, test_ages = evaluate_model(model, test_loader, device, is_capped=is_capped)
     
-    return tr_mae, tr_mape, va_mae, va_mape, te_mae, te_mape, test_preds, test_true, test_events
+    return tr_mae, tr_mape, va_mae, va_mape, te_mae, te_mape, test_preds, test_true, test_events, test_ages
 
 
-# --- 6. Architectural Pruning Controller ---
+# =========================================================================
+# 6. Architectural Pruning Controller
+# =========================================================================
 def check_architectural_pruning(history, max_patience=2, gap_threshold=35.0, gap_growth_ratio=1.35):
     if len(history) < 2:
         return False, ""
@@ -352,10 +454,12 @@ def check_architectural_pruning(history, max_patience=2, gap_threshold=35.0, gap
     return False, ""
 
 
-# --- 7. Rigorous Kaplan-Meier Estimator with Binary Event Vector ---
+# =========================================================================
+# 7. Kaplan-Meier Survival Analysis with Scenario B Censoring
+# =========================================================================
 def compute_kaplan_meier_curve(durations, events):
     """
-    Computes the non-parametric Kaplan-Meier survival curve S(t) = Prod (1 - d_i / n_i)
+    Computes non-parametric Kaplan-Meier survival curve S(t) = Prod (1 - d_i / n_i)
     explicitly accounting for event occurrences (E=1) and right-censored cases (E=0).
     """
     durations = np.asarray(durations, dtype=np.float64)
@@ -385,39 +489,36 @@ def compute_kaplan_meier_curve(durations, events):
     return np.array(km_t), np.array(km_s)
 
 
-def get_survival_probability_at_time(km_times, km_probs, target_time):
-    idx = np.searchsorted(km_times, target_time, side='right') - 1
-    idx = np.clip(idx, 0, len(km_probs) - 1)
-    return float(km_probs[idx])
-
-
-def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred, y_test_events):
+def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred, y_test_events, test_ages):
     y_test_true = np.asarray(y_test_true, dtype=np.float32)
     y_test_pred = np.asarray(y_test_pred, dtype=np.float32)
     y_test_events = np.asarray(y_test_events, dtype=np.int32)
+    test_ages = np.asarray(test_ages, dtype=np.float32)
     
-    # Clinical Triage: Green defined as TTE >= 360d for all datasets
+    # Clinical Triage cut-offs (Number of hemodialysis sessions per class)
     mask_red = y_test_pred < T_RED
     mask_yellow = (y_test_pred >= T_RED) & (y_test_pred < T_GREEN)
     mask_green = y_test_pred >= T_GREEN
     
-    # 1. KM Curve for Red Class (High Risk) -> Minimize P_R at 180d
+    # 1. Red Class (High Risk) -> P_R at 180d
     if np.sum(mask_red) > 0:
         t_r, s_r = compute_kaplan_meier_curve(y_test_true[mask_red], y_test_events[mask_red])
-        p_r = get_survival_probability_at_time(t_r, s_r, KM_EVAL_RED)
+        idx = np.searchsorted(t_r, KM_EVAL_RED, side='right') - 1
+        p_r = float(s_r[np.clip(idx, 0, len(s_r) - 1)])
     else:
         t_r, s_r = np.array([0.0, KM_EVAL_RED]), np.array([1.0, 1.0])
         p_r = 1.0
         
-    # 2. KM Curve for Green Class (Low Risk) -> Maximize P_G at 360d
+    # 2. Green Class (Low Risk) -> P_G at 360d
     if np.sum(mask_green) > 0:
         t_g, s_g = compute_kaplan_meier_curve(y_test_true[mask_green], y_test_events[mask_green])
-        p_g = get_survival_probability_at_time(t_g, s_g, KM_EVAL_GREEN)
+        idx = np.searchsorted(t_g, KM_EVAL_GREEN, side='right') - 1
+        p_g = float(s_g[np.clip(idx, 0, len(s_g) - 1)])
     else:
         t_g, s_g = np.array([0.0, KM_EVAL_GREEN]), np.array([0.0, 0.0])
         p_g = 0.0
         
-    # 3. KM Curve for Yellow Class (Moderate Risk)
+    # 3. Yellow Class (Moderate Risk)
     if np.sum(mask_yellow) > 0:
         t_y, s_y = compute_kaplan_meier_curve(y_test_true[mask_yellow], y_test_events[mask_yellow])
     else:
@@ -425,13 +526,28 @@ def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred, y_test_events):
         
     p_bar_g = 1.0 - p_g
     
+    # Calculate mean patient age across session cohorts
+    has_valid_age = not np.all(np.isnan(test_ages))
+    if has_valid_age:
+        age_red = round(float(np.nanmean(test_ages[mask_red])), 1) if np.sum(mask_red) > 0 else np.nan
+        age_yellow = round(float(np.nanmean(test_ages[mask_yellow])), 1) if np.sum(mask_yellow) > 0 else np.nan
+        age_green = round(float(np.nanmean(test_ages[mask_green])), 1) if np.sum(mask_green) > 0 else np.nan
+        age_total = round(float(np.nanmean(test_ages)), 1) if len(test_ages) > 0 else np.nan
+    else:
+        age_red, age_yellow, age_green, age_total = np.nan, np.nan, np.nan, np.nan
+        
     return {
         "P_R": round(p_r, 4),
         "P_G": round(p_g, 4),
         "P_bar_G": round(p_bar_g, 4),
-        "N_Red": int(np.sum(mask_red)),
-        "N_Yellow": int(np.sum(mask_yellow)),
-        "N_Green": int(np.sum(mask_green)),
+        "Sessions_Red": int(np.sum(mask_red)),
+        "Sessions_Yellow": int(np.sum(mask_yellow)),
+        "Sessions_Green": int(np.sum(mask_green)),
+        "Total_Sessions": len(y_test_true),
+        "Age_Red": age_red,
+        "Age_Yellow": age_yellow,
+        "Age_Green": age_green,
+        "Age_Total": age_total,
         "km_curves": {
             "Red": (t_r, s_r),
             "Yellow": (t_y, s_y),
@@ -440,11 +556,10 @@ def evaluate_triage_and_kaplan_meier(y_test_true, y_test_pred, y_test_events):
     }
 
 
-# --- 8. Pareto Frontier Identification with Clinical Cohort Filter ---
+# =========================================================================
+# 8. Pareto Frontier Identification (Bi-Objective Minimization)
+# =========================================================================
 def compute_pareto_mask(p_bar_g_arr, p_r_arr):
-    """
-    Computes non-dominated Pareto mask for bi-objective minimization of (P_bar_G, P_R).
-    """
     pts = np.column_stack([p_bar_g_arr, p_r_arr])
     n = len(pts)
     is_pareto = np.ones(n, dtype=bool)
@@ -458,20 +573,34 @@ def compute_pareto_mask(p_bar_g_arr, p_r_arr):
     return is_pareto
 
 
-# --- 9. Plotting with Extended Time Axis (500+ Days) and Unique Tags ---
-def plot_kaplan_meier_curves(km_data, title, save_path, min_x_extent=KM_MAX_DISPLAY_TIME):
+# =========================================================================
+# 9. Plotting Functions (X-axis extended to 1000-1500+ Days)
+# =========================================================================
+def plot_kaplan_meier_curves(km_data, title, save_path, min_x_extent=KM_MIN_DISPLAY_DAYS):
+    """
+    Plots Kaplan-Meier curves for all three classes with x-axis extending to 1000-1500+ days.
+    Legends explicitly display the number of hemodialysis sessions and mean patient age.
+    """
     plt.figure(figsize=(9.5, 5.5))
     
     colors = {'Green': '#2ca02c', 'Yellow': '#ff7f0e', 'Red': '#d62728'}
+    
+    def format_legend(c, name, threshold_str, count_key, age_key):
+        count = km_data[count_key]
+        age_val = km_data[age_key]
+        age_str = f", Mean Age={age_val:.1f}y" if not np.isnan(age_val) else ""
+        return f"{name} ({threshold_str}, Sessions={count:,}{age_str})"
+
     labels = {
-        'Green': f"Green (Pred >= {int(T_GREEN)}d, N={km_data['N_Green']})",
-        'Yellow': f"Yellow ({int(T_RED)}-{int(T_GREEN)}d, N={km_data['N_Yellow']})",
-        'Red': f"Red (Pred < {int(T_RED)}d, N={km_data['N_Red']})"
+        'Green': format_legend('Green', 'Green', f"Pred >= {int(T_GREEN)}d", 'Sessions_Green', 'Age_Green'),
+        'Yellow': format_legend('Yellow', 'Yellow', f"{int(T_RED)}-{int(T_GREEN)}d", 'Sessions_Yellow', 'Age_Yellow'),
+        'Red': format_legend('Red', 'Red', f"Pred < {int(T_RED)}d", 'Sessions_Red', 'Age_Red')
     }
     line_widths = {'Green': 2.5, 'Yellow': 2.0, 'Red': 2.5}
     
     observed_max_times = [np.max(km_data["km_curves"][c][0]) for c in ['Green', 'Yellow', 'Red']]
-    x_axis_limit = max(min_x_extent, float(np.max(observed_max_times)))
+    max_observed = float(np.max(observed_max_times))
+    x_axis_limit = max(min_x_extent, max_observed)
     
     for c in ['Green', 'Yellow', 'Red']:
         t_c, s_c = km_data["km_curves"][c]
@@ -504,46 +633,13 @@ def plot_kaplan_meier_curves(km_data, title, save_path, min_x_extent=KM_MAX_DISP
     plt.ylim(-0.05, 1.05)
     plt.xlim(0, x_axis_limit)
     
-    x_ticks = [0, 100, 180, 250, 360, int(x_axis_limit)]
+    x_ticks = [0, 180, 360, 500, 750, 1000]
+    if x_axis_limit > 1050:
+        x_ticks.append(int(x_axis_limit))
     plt.xticks(x_ticks, labels=[str(xt) for xt in x_ticks])
     
     plt.grid(True, linestyle=":", alpha=0.6)
-    plt.legend(loc="lower left", frameon=True)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-
-
-def plot_scenario_pareto(df_scenario, title, save_path):
-    if df_scenario.empty:
-        return
-        
-    pts = df_scenario[["P_bar_G", "P_R"]].values
-    is_pareto = compute_pareto_mask(pts[:, 0], pts[:, 1])
-    df_scenario["is_pareto"] = is_pareto
-    
-    pareto_pts = df_scenario[df_scenario["is_pareto"]].sort_values(by="P_bar_G")
-    dominated_pts = df_scenario[~df_scenario["is_pareto"]]
-    
-    plt.figure(figsize=(8.5, 6.5))
-    if not dominated_pts.empty:
-        plt.scatter(dominated_pts["P_bar_G"], dominated_pts["P_R"], color="#909090", alpha=0.5, s=60, label="Dominated Models")
-        for _, r in dominated_pts.iterrows():
-            plt.annotate(f"H{int(r['Hidden_H'])}", (r["P_bar_G"], r["P_R"]), textcoords="offset points", xytext=(4, 4), fontsize=8, color="#555555")
-            
-    plt.plot(pareto_pts["P_bar_G"], pareto_pts["P_R"], color="#d62728", linestyle="-", linewidth=2.0, zorder=4)
-    plt.scatter(pareto_pts["P_bar_G"], pareto_pts["P_R"], color="#d62728", s=110, zorder=5, label="Pareto Frontier (Non-Dominated)")
-    for _, r in pareto_pts.iterrows():
-        plt.annotate(f"H{int(r['Hidden_H'])}\n({r['Parameters']}p)", (r["P_bar_G"], r["P_R"]), textcoords="offset points", xytext=(6, -6), fontsize=9, fontweight="bold", color="#d62728")
-        
-    plt.scatter([0], [0], color="#1f77b4", marker="*", s=180, zorder=6, label="Ideal Point (0, 0)")
-    plt.xlabel(r"$\bar{P}_G = 1 - P_G$ (Minimize $\to 0$)", fontsize=11)
-    plt.ylabel(r"$P_R$ (Minimize $\to 0$)", fontsize=11)
-    plt.title(title, fontsize=12, fontweight="bold")
-    plt.xlim(-0.02, max(1.0, df_scenario["P_bar_G"].max() * 1.08))
-    plt.ylim(-0.02, max(1.0, df_scenario["P_R"].max() * 1.08))
-    plt.grid(True, linestyle=":", alpha=0.6)
-    plt.legend(loc="upper right", frameon=True)
+    plt.legend(loc="lower left", frameon=True, fontsize=9.5)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
@@ -551,30 +647,32 @@ def plot_scenario_pareto(df_scenario, title, save_path):
 
 def plot_global_pareto_numbered(df_all, title, save_path):
     """
-    Plots the Global Pareto Frontier with sequential numbered tags (KM 1, KM 2, ...)
-    directly corresponding to the individually exported Kaplan-Meier plots.
-    Filtered for clinical validity (cohort size >= MIN_TRIAGE_SAMPLES).
+    Plots the Global Pareto Frontier showing Model_Num (1, 2, 3, ...) for ALL evaluated configurations.
+    Non-dominated Pareto points are highlighted with red boxed badges and connected via the frontier line.
     """
-    pts = df_all[["P_bar_G", "P_R"]].values
-    is_pareto = df_all["is_pareto"].values
-    
     pareto_pts = df_all[df_all["is_pareto"]].sort_values(by="P_bar_G").reset_index(drop=True)
     dominated_pts = df_all[~df_all["is_pareto"]]
     
-    plt.figure(figsize=(9.5, 7.5))
+    plt.figure(figsize=(11, 7.5))
+    
+    # Dominated configurations with neat numeric labels
     if not dominated_pts.empty:
-        plt.scatter(dominated_pts["P_bar_G"], dominated_pts["P_R"], color="#a5a5a5", alpha=0.5, s=50, label="Dominated Models")
-        
+        plt.scatter(dominated_pts["P_bar_G"], dominated_pts["P_R"], color="#a5a5a5", alpha=0.55, s=55, label="Dominated Configurations")
+        for _, r in dominated_pts.iterrows():
+            plt.annotate(str(int(r["Model_Num"])), (r["P_bar_G"], r["P_R"]),
+                         textcoords="offset points", xytext=(3, 3), fontsize=7, color="#555555", alpha=0.85)
+            
+    # Non-dominated Pareto frontier
     plt.plot(pareto_pts["P_bar_G"], pareto_pts["P_R"], color="#d62728", linestyle="-", linewidth=2.2, zorder=4)
     plt.scatter(pareto_pts["P_bar_G"], pareto_pts["P_R"], color="#d62728", s=130, zorder=5, label="Pareto Frontier (Non-Dominated)")
     
     for idx, r in pareto_pts.iterrows():
-        km_tag = r["Pareto_ID"]
+        model_num_tag = f"#{int(r['Model_Num'])}"
         offset_y = 12 if idx % 2 == 0 else -20
         offset_x = 10 if r["P_bar_G"] < 0.8 else -45
         
         plt.annotate(
-            km_tag,
+            model_num_tag,
             (r["P_bar_G"], r["P_R"]),
             textcoords="offset points",
             xytext=(offset_x, offset_y),
@@ -586,8 +684,8 @@ def plot_global_pareto_numbered(df_all, title, save_path):
         )
         
     plt.scatter([0], [0], color="#1f77b4", marker="*", s=220, zorder=6, label="Ideal Point (0, 0)")
-    plt.xlabel(r"$\bar{P}_G = 1 - P_G$ (Minimize $\to 0$)", fontsize=12, fontweight="bold")
-    plt.ylabel(r"$P_R$ (Minimize $\to 0$)", fontsize=12, fontweight="bold")
+    plt.xlabel(r"$\bar{P}_G = 1 - P_G$ (Failure Rate at 360d $\to 0$)", fontsize=12, fontweight="bold")
+    plt.ylabel(r"$P_R$ (False Survival Rate at 180d $\to 0$)", fontsize=12, fontweight="bold")
     plt.title(title, fontsize=13, fontweight="bold")
     plt.xlim(-0.04, 1.06)
     plt.ylim(-0.04, 1.06)
@@ -598,16 +696,22 @@ def plot_global_pareto_numbered(df_all, title, save_path):
     plt.close()
 
 
-# --- 10. Main Pipeline Execution ---
+# =========================================================================
+# 10. Main Pipeline Execution
+# =========================================================================
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n=========================================================================")
-    print(f" COMPLETE PIPELINE: FFNN + RIGOROUS KM + STANDARDIZED NAMING & FILTERED PARETO")
+    print(f" PIPELINE: FFNN TRAINING + SCENARIO B CENSORING (1000d+) + GLOBAL PARETO")
     print(f" COMPUTATION DEVICE: {device}")
     print(f"=========================================================================\n")
     
+    # Load patient age mapping from patient_age.json in Datasets directory
+    age_map = load_patient_age_map(DATASETS_DIR)
+    
     all_results = []
     all_km_cache = {}
+    model_counter = 0  # Global sequential model counter: 1, 2, 3, ...
     
     for ds_entry in DATASET_FILES:
         ds_name = ds_entry["name"]
@@ -622,23 +726,25 @@ def main():
             print(f"[WARNING] File not found: {file_path}. Skipping dataset.")
             continue
             
-        print(f"\n{'='*90}\n DATASET: {ds_name} (M={M}, W={W}, Target={target_str})\n{'='*90}")
+        print(f"\n{'='*90}\n DATASET: {ds_name} (Features M={M}, Window W={W}, Target={target_str})\n{'='*90}")
         df_raw, pid_col = load_dataset(file_path)
-        X_raw, y_log, y_days, events_all, pid_all, time_all = prepare_raw_data(df_raw, pid_col, is_capped=is_capped)
+        X_raw, y_log, y_days, events_all, age_all, pid_all, time_all = prepare_raw_data(
+            df_raw, pid_col, is_capped=is_capped, age_map=age_map
+        )
         
         for split_mode in SPLIT_MODES:
             print(f"\n>>> Split Mode: {split_mode.upper()} <<<")
             train_mask, val_mask, test_mask = create_split_masks(pid_all, time_all, split_mode=split_mode)
             
-            X_tr, y_tr_log, y_tr_d, ev_tr = extract_features(X_raw, y_log, y_days, events_all, pid_all, train_mask, W)
-            X_va, y_va_log, y_va_d, ev_va = extract_features(X_raw, y_log, y_days, events_all, pid_all, val_mask, W)
-            X_te, y_te_log, y_te_d, ev_te = extract_features(X_raw, y_log, y_days, events_all, pid_all, test_mask, W)
+            X_tr, y_tr_log, y_tr_d, ev_tr, age_tr = extract_features(X_raw, y_log, y_days, events_all, age_all, pid_all, train_mask, W)
+            X_va, y_va_log, y_va_d, ev_va, age_va = extract_features(X_raw, y_log, y_days, events_all, age_all, pid_all, val_mask, W)
+            X_te, y_te_log, y_te_d, ev_te, age_te = extract_features(X_raw, y_log, y_days, events_all, age_all, pid_all, test_mask, W)
             
             if len(X_tr) == 0 or len(X_va) == 0 or len(X_te) == 0:
-                print(f"[SKIP] Insufficient samples for split {split_mode}.")
+                print(f"[SKIP] Insufficient sessions for split {split_mode}.")
                 continue
                 
-            # Z-score normalization computed exclusively on the Training set
+            # Z-score standardization computed exclusively on training split
             mean = X_tr.mean(axis=0, keepdims=True)
             std = X_tr.std(axis=0, keepdims=True)
             std[std == 0] = 1.0
@@ -647,45 +753,43 @@ def main():
             X_va_s = (X_va - mean) / std
             X_te_s = (X_te - mean) / std
             
-            train_loader = DataLoader(TabularLogDataset(X_tr_s, y_tr_log, y_tr_d, ev_tr), batch_size=BATCH_SIZE, shuffle=True)
-            val_loader = DataLoader(TabularLogDataset(X_va_s, y_va_log, y_va_d, ev_va), batch_size=BATCH_SIZE, shuffle=False)
-            test_loader = DataLoader(TabularLogDataset(X_te_s, y_te_log, y_te_d, ev_te), batch_size=BATCH_SIZE, shuffle=False)
+            train_loader = DataLoader(TabularLogDataset(X_tr_s, y_tr_log, y_tr_d, ev_tr, age_tr), batch_size=BATCH_SIZE, shuffle=True)
+            val_loader = DataLoader(TabularLogDataset(X_va_s, y_va_log, y_va_d, ev_va, age_va), batch_size=BATCH_SIZE, shuffle=False)
+            test_loader = DataLoader(TabularLogDataset(X_te_s, y_te_log, y_te_d, ev_te, age_te), batch_size=BATCH_SIZE, shuffle=False)
             
             N = X_tr_s.shape[1]
             base_steps = [1, 2, 3, 5, 8, 16, 32, 64, 128]
             candidate_H = sorted(list(set([h for h in base_steps if h < N] + [N])))
             
-            print(f"Input features N = {N} (4 x {M} measures). Hidden nodes H: {candidate_H}")
+            print(f"Input Features N = {N} (4 x {M} measures). Hidden Units Grid: {candidate_H}")
             
             arch_history = []
-            dataset_split_results = []
             
             for h in candidate_H:
-                # Standardized naming pattern: M<features>_W<finestra>_H<nodi>_<target>_<split>
+                model_counter += 1
+                model_num = model_counter
                 model_id = f"M{M}_W{W}_H{h}_{target_str}_{split_mode}"
                 
                 model = SystematicFFNN(input_dim=N, hidden_dim=h).to(device)
                 num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
                 
-                tr_mae, tr_mape, va_mae, va_mape, te_mae, te_mape, test_preds, test_true, test_events = train_model(
+                tr_mae, tr_mape, va_mae, va_mape, te_mae, te_mape, test_preds, test_true, test_events, test_ages = train_model(
                     model, train_loader, val_loader, test_loader, device, is_capped=is_capped
                 )
                 
-                # Save model weights with standardized naming
-                weights_path = os.path.join(WEIGHTS_DIR, f"{model_id}.pt")
+                # Save trained weights with Model_Num prefix
+                weights_path = os.path.join(WEIGHTS_DIR, f"Model_{model_num}_{model_id}.pt")
                 torch.save(model.state_dict(), weights_path)
                 
-                # Evaluate Triage and Kaplan-Meier with explicit event vector
-                triage_metrics = evaluate_triage_and_kaplan_meier(test_true, test_preds, test_events)
-                
-                # Cache survival curve data associated with model_id
-                all_km_cache[model_id] = triage_metrics
+                # Evaluate Triage and Kaplan-Meier (Scenario B applied)
+                triage_metrics = evaluate_triage_and_kaplan_meier(test_true, test_preds, test_events, test_ages)
+                all_km_cache[model_num] = (model_id, triage_metrics)
                 
                 diff_tr_te = abs(tr_mae - te_mae)
                 
                 entry = {
+                    "Model_Num": model_num,
                     "Model_ID": model_id,
-                    "Pareto_ID": "-",
                     "Dataset": ds_name,
                     "Features": f"M{M}",
                     "Window": f"W{W}",
@@ -705,85 +809,81 @@ def main():
                     "P_R": triage_metrics["P_R"],
                     "P_G": triage_metrics["P_G"],
                     "P_bar_G": triage_metrics["P_bar_G"],
-                    "N_Red": triage_metrics["N_Red"],
-                    "N_Yellow": triage_metrics["N_Yellow"],
-                    "N_Green": triage_metrics["N_Green"]
+                    "Sessions_Red": triage_metrics["Sessions_Red"],
+                    "Sessions_Yellow": triage_metrics["Sessions_Yellow"],
+                    "Sessions_Green": triage_metrics["Sessions_Green"],
+                    "Total_Sessions": triage_metrics["Total_Sessions"],
+                    "Age_Red": triage_metrics["Age_Red"],
+                    "Age_Yellow": triage_metrics["Age_Yellow"],
+                    "Age_Green": triage_metrics["Age_Green"],
+                    "Age_Total": triage_metrics["Age_Total"]
                 }
                 all_results.append(entry)
-                dataset_split_results.append(entry)
                 arch_history.append({"H": h, "train_mae": tr_mae, "val_mae": va_mae, "test_mae": te_mae})
                 
-                print(f"  [{model_id}] ({num_params:5d}p) -> Test MAE: {te_mae:5.2f}d | "
-                      f"P_R(180d): {triage_metrics['P_R']:.4f} | P_G(360d): {triage_metrics['P_G']:.4f} | "
-                      f"Counts (R/Y/G): {triage_metrics['N_Red']}/{triage_metrics['N_Yellow']}/{triage_metrics['N_Green']}")
+                age_summary_str = f" | Ages (R/Y/G): {triage_metrics['Age_Red']}/{triage_metrics['Age_Yellow']}/{triage_metrics['Age_Green']}" if not np.isnan(triage_metrics['Age_Total']) else ""
+                print(f"  [Model #{model_num:2d}: {model_id}] -> Test MAE: {te_mae:5.2f}d | "
+                      f"P_R: {triage_metrics['P_R']:.4f} | P_G: {triage_metrics['P_G']:.4f} | "
+                      f"Sessions (R/Y/G): {triage_metrics['Sessions_Red']}/{triage_metrics['Sessions_Yellow']}/{triage_metrics['Sessions_Green']}"
+                      f"{age_summary_str}")
                 
                 should_prune, reason = check_architectural_pruning(arch_history)
                 if should_prune:
-                    print(f"     ==> [PRUNING] Stopped H expansion for {model_id}. Reason: {reason}")
+                    print(f"     ==> [PRUNING] Stopped H expansion for Model #{model_num}. Reason: {reason}")
                     break
-                    
-            # Save individual scenario Pareto plot
-            df_scenario = pd.DataFrame(dataset_split_results)
-            scenario_pareto_file = os.path.join(PLOTS_DIR, f"pareto_M{M}_W{W}_{target_str}_{split_mode}.png")
-            plot_scenario_pareto(df_scenario, f"Pareto: M{M}_W{W}_{target_str}_{split_mode}", scenario_pareto_file)
 
-    # --- 11. Global Pareto Optimization with Clinical Validity Filter ---
+    # =========================================================================
+    # 11. Global Pareto Optimization & Universal Kaplan-Meier Export
+    # =========================================================================
     df_all = pd.DataFrame(all_results)
     if not df_all.empty:
         df_all["is_pareto"] = False
-        df_all["Pareto_ID"] = "-"
         
-        # Clinical Validity Filter: exclude degenerate models with near-empty cohorts (< MIN_TRIAGE_SAMPLES)
-        valid_mask = (df_all["N_Green"] >= MIN_TRIAGE_SAMPLES) & (df_all["N_Red"] >= MIN_TRIAGE_SAMPLES)
+        # Clinical Validity Filter (ensures minimum cohort size of 500 sessions in both extreme classes)
+        valid_mask = (df_all["Sessions_Green"] >= MIN_TRIAGE_SAMPLES) & (df_all["Sessions_Red"] >= MIN_TRIAGE_SAMPLES)
         valid_indices = df_all[valid_mask].index
         
         if len(valid_indices) > 0:
             valid_p_bar_g = df_all.loc[valid_indices, "P_bar_G"].values
             valid_p_r = df_all.loc[valid_indices, "P_R"].values
-            
             pareto_sub_mask = compute_pareto_mask(valid_p_bar_g, valid_p_r)
             actual_pareto_indices = valid_indices[pareto_sub_mask]
-            
             df_all.loc[actual_pareto_indices, "is_pareto"] = True
-            pareto_sorted_indices = df_all.loc[actual_pareto_indices].sort_values(by="P_bar_G").index
             
-            print(f"\n{'='*110}\n EXPORTING NUMBERED KM CURVES FOR ROBUST PARETO MODELS (KM 1 - KM K)\n{'='*110}")
-            print(f"Filter applied: N_Red >= {MIN_TRIAGE_SAMPLES} and N_Green >= {MIN_TRIAGE_SAMPLES} "
-                  f"({len(valid_indices)}/{len(df_all)} clinically valid configurations)")
+        print(f"\n{'='*110}\n EXPORTING KAPLAN-MEIER CURVES FOR ALL EVALUATED CONFIGURATIONS (X-AXIS UP TO 1000-1500d+)\n{'='*110}")
+        
+        # Export survival plots for ALL evaluated models
+        for model_num, (mid, km_data) in all_km_cache.items():
+            row = df_all[df_all["Model_Num"] == model_num].iloc[0]
+            is_opt = row["is_pareto"]
+            status_tag = "[PARETO OPTIMAL]" if is_opt else "[DOMINATED]"
             
-            for idx, orig_idx in enumerate(pareto_sorted_indices):
-                km_num = idx + 1
-                km_tag = f"KM {km_num}"
-                df_all.loc[orig_idx, "Pareto_ID"] = km_tag
-                
-                row = df_all.loc[orig_idx]
-                mid = row["Model_ID"]
-                
-                if mid in all_km_cache:
-                    km_data = all_km_cache[mid]
-                    km_title = f"[{km_tag}] Kaplan-Meier Triage - {mid}"
-                    km_filename = os.path.join(PLOTS_DIR, f"KM_{km_num}_{mid}.png")
-                    plot_kaplan_meier_curves(km_data, km_title, km_filename, min_x_extent=KM_MAX_DISPLAY_TIME)
-                    print(f"  --> Saved survival curve [{km_tag}]: {km_filename}")
-                    
-            # Export Global Pareto Frontier plot with numbered badges
-            global_pareto_file = os.path.join(PLOTS_DIR, "pareto_frontier_global_numbered.png")
-            plot_global_pareto_numbered(df_all[valid_mask].copy(), "Global Pareto Frontier (Clinically Valid Cohorts)", global_pareto_file)
-            print(f"\nSaved Numbered Global Pareto Frontier: {global_pareto_file}")
-        else:
-            print("\n[WARNING] No configurations met the minimum triage cohort size filter.")
+            km_title = f"{status_tag} Model #{model_num} - {mid}"
+            km_filename = os.path.join(PLOTS_DIR, f"KM_Model_{model_num}_{mid}.png")
             
+            plot_kaplan_meier_curves(km_data, km_title, km_filename, min_x_extent=KM_MIN_DISPLAY_DAYS)
+            
+        print(f"Exported {len(all_km_cache)} Kaplan-Meier plots to: {PLOTS_DIR}")
+        
+        # Generate Global Pareto Frontier with every model numbered
+        global_pareto_file = os.path.join(PLOTS_DIR, "pareto_frontier_global_numbered.png")
+        plot_global_pareto_numbered(df_all, "Global Pareto Frontier (All Configurations Numbered 1 to N)", global_pareto_file)
+        print(f"Saved Numbered Global Pareto Frontier: {global_pareto_file}")
+        
         # Save complete results table to CSV
         out_csv = os.path.join(BASE_DIR, "final_systematic_ffnn_triage_pareto_results.csv")
         df_all.to_csv(out_csv, index=False)
         print(f"Full results exported to: {out_csv}")
         
-        # Summary display of non-dominated Pareto models
+        # Display Pareto-optimal models in console
         pareto_table = df_all[df_all["is_pareto"]].sort_values(by="P_bar_G")
-        disp_cols = ["Pareto_ID", "Model_ID", "Parameters", "Train_MAE_days", "Test_MAE_days", 
-                     "Diff_Train_Test", "P_R", "P_G", "P_bar_G", "N_Red", "N_Green"]
+        disp_cols = ["Model_Num", "Model_ID", "Parameters", "Train_MAE_days", "Test_MAE_days", 
+                     "Diff_Train_Test", "P_R", "P_G", "P_bar_G", "Sessions_Red", "Sessions_Green"]
+        if not np.all(np.isnan(df_all["Age_Total"])):
+            disp_cols.extend(["Age_Red", "Age_Green", "Age_Total"])
+            
         print("\n" + "="*125)
-        print(" PARETO OPTIMAL MODELS (MAPPED WITH KM IDENTIFIERS)")
+        print(" PARETO OPTIMAL CONFIGURATIONS (REFERENCED BY MODEL NUMBER)")
         print("="*125)
         print(pareto_table[disp_cols].to_string(index=False))
         print("="*125)
