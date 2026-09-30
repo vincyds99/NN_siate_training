@@ -1,0 +1,4 @@
+Architecture / Pipeline,Train MAE (days),Val MAE (days),Test MAE (days),Train MAPE (%),Val MAPE (%),Test MAPE (%)
+ExtremeBottleneckFFNN_3Node_W30,90.6,79.31,103.73,24.85,29.53,233.95
+UltraBottleneckFFNN_2Node_W30,357.81,309.94,148.36,94.45,92.95,81.12
+ErgodicLinearFFNN_Reg_W30,353.91,303.97,169.5,93.5,91.79,160.28

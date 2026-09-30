@@ -11,5 +11,7 @@ env/
 dist/
 build/
 *.egg-info/
-*.csv
 *.npy
+Datasets/*.csv
+Datasets/old/*.csv
+Datasets/old1/*.csv

@@ -1,0 +1,5 @@
+Architecture / Pipeline,Val MAPE (%),Val MAE (days),Test MAPE (%),Test MAE (days)
+BiLSTM_32_1L_Winner_Baseline,78.72,197.42,78.88,201.7
+BiLSTM_32_1L_FeatureDeltas,76.23,137.39,69.39,137.2
+BiLSTM_32_1L_WarmRestarts,75.97,169.25,73.32,171.29
+BiLSTM_32_1L_Deltas_HybridLoss,77.14,170.29,73.34,174.69
