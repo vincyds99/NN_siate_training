@@ -945,7 +945,6 @@ def main():
     print(f"\n[EXPORT] Rendering Kaplan-Meier curves into: {PLOTS_DIR}")
     
     # 1. Export KM plots for all non-dominated Pareto models and winning models
-    # (Oppure per tutti i modelli valutati rimuovendo il filtro 'if is_pareto or is_winner')
     winner_nums = set(winners_df["Model_Num"].values) if not winners_df.empty else set()
     
     for model_num, (mid, km_data) in all_km_cache.items():
@@ -954,10 +953,8 @@ def main():
         is_winner = model_num in winner_nums
         is_valid = row["Clinically_Valid"]
         
-        # Tag per identificare lo stato del modello nel titolo
         status_tag = "[PARETO]" if is_opt else ("[WINNER]" if is_winner else ("[VALID]" if is_valid else "[PRUNED]"))
         
-        # Salva la curva KM (se desideri salvarli TUTTI gli 800+ modelli lascia la chiamata diretta):
         km_title = f"{status_tag} Model #{model_num} - {mid}"
         km_filename = os.path.join(PLOTS_DIR, f"KM_Model_{model_num}_{mid}.png")
         plot_kaplan_meier_curves(km_data, km_title, km_filename, min_x_extent=KM_MIN_DISPLAY_DAYS)

@@ -1,4 +1,0 @@
-Architecture / Pipeline,Train MAE (days),Val MAE (days),Test MAE (days),Train MAPE (%),Val MAPE (%),Test MAPE (%)
-DirectLinearFFNN_n_to_1_W60,274.35,268.97,410.0,72.25,87.33,665.52
-Small3LayerFFNN_n_n10_3_1_W60,31.68,39.91,114.47,8.41,15.97,266.93
-Micro2LayerFFNN_n_n10_1_W60,17.65,38.21,118.04,5.44,17.39,272.69
